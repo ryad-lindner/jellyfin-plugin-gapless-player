@@ -1,4 +1,5 @@
 import type { AppHostApi, AppSettingsApi, EventsApi, PlaybackManagerApi, PluginDeps } from './deps';
+import { setToggleDeps } from './toggle';
 
 const TICKS_PER_MS = 10000;
 const VOLUME_EXPONENT = 3;
@@ -144,6 +145,8 @@ class WebAudioGaplessPlayer {
         this._playbackManager = deps.playbackManager;
         this._appHost = deps.appHost;
         this._volume = this.getSavedVolumeLevel();
+        // Let the now-playing-bar toggle restart the queue on the other player.
+        setToggleDeps(deps);
     }
 
     // --- Local settings (localStorage via appSettings) ---------------------

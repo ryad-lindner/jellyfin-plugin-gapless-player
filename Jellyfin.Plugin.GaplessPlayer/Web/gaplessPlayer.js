@@ -1,12 +1,128 @@
 "use strict";
 (() => {
+  // src/toggle.ts
+  var SETTING_ENABLED = "enableWebAudioGapless";
+  var BUTTON_CLASS = "gaplessToggleButton";
+  var LOG_PREFIX = "[GaplessPlayer]";
+  var deps = null;
+  function setToggleDeps(value) {
+    deps = value;
+  }
+  function isEnabled() {
+    const value = localStorage.getItem(SETTING_ENABLED);
+    return value == null ? true : value === "true";
+  }
+  function setEnabled(value) {
+    localStorage.setItem(SETTING_ENABLED, String(value));
+  }
+  function showToast(message) {
+    const el = document.createElement("div");
+    el.textContent = message;
+    el.style.cssText = [
+      "position:fixed",
+      "bottom:8em",
+      "left:50%",
+      "transform:translateX(-50%)",
+      "background:rgba(0,0,0,0.85)",
+      "color:#fff",
+      "padding:0.6em 1em",
+      "border-radius:0.3em",
+      "z-index:10000",
+      "font-size:0.9em",
+      "transition:opacity 0.4s",
+      "pointer-events:none"
+    ].join(";");
+    document.body.appendChild(el);
+    setTimeout(() => {
+      el.style.opacity = "0";
+    }, 1800);
+    setTimeout(() => {
+      el.remove();
+    }, 2300);
+  }
+  function updateButton(button) {
+    const enabled = isEnabled();
+    button.title = enabled ? "Gapless playback: on" : "Gapless playback: off";
+    button.style.opacity = enabled ? "1" : "0.4";
+    const icon = button.querySelector(".material-icons");
+    if (icon) {
+      icon.textContent = "graphic_eq";
+    }
+  }
+  async function restartCurrentQueue(enabled) {
+    const pm = deps?.playbackManager;
+    if (!pm) {
+      return false;
+    }
+    try {
+      if (typeof pm.isPlaying === "function" && !pm.isPlaying()) {
+        return false;
+      }
+      const items = typeof pm.getPlaylist === "function" ? await pm.getPlaylist() : null;
+      if (!Array.isArray(items) || items.length === 0) {
+        return false;
+      }
+      const index = typeof pm.getCurrentPlaylistIndex === "function" ? Number(pm.getCurrentPlaylistIndex()) : 0;
+      const positionMs = typeof pm.currentTime === "function" ? Number(pm.currentTime()) : 0;
+      await pm.play({
+        items,
+        startIndex: Math.max(0, index),
+        startPositionTicks: Math.max(0, Math.round(positionMs * 1e4)),
+        enableWebAudioGapless: enabled
+      });
+      return true;
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} live toggle restart failed; applies on next playback`, err);
+      return false;
+    }
+  }
+  function onClick(button) {
+    const enabled = !isEnabled();
+    setEnabled(enabled);
+    updateButton(button);
+    void restartCurrentQueue(enabled).then((restarted) => {
+      const base = enabled ? "Gapless playback enabled" : "Gapless playback disabled";
+      showToast(restarted ? base : `${base} (applies on next playback)`);
+    });
+  }
+  function createButton() {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `${BUTTON_CLASS} paper-icon-button-light mediaButton`;
+    button.setAttribute("is", "paper-icon-button-light");
+    button.innerHTML = '<span class="material-icons" aria-hidden="true">graphic_eq</span>';
+    button.addEventListener("click", () => onClick(button));
+    updateButton(button);
+    return button;
+  }
+  function injectInto(container) {
+    if (container.querySelector(`.${BUTTON_CLASS}`)) {
+      return;
+    }
+    const button = createButton();
+    const anchor = container.querySelector(".btnToggleContextMenu");
+    if (anchor) {
+      container.insertBefore(button, anchor);
+    } else {
+      container.appendChild(button);
+    }
+  }
+  function initToggleUi() {
+    const tryInject = () => {
+      document.querySelectorAll(".nowPlayingBarRight").forEach(injectInto);
+    };
+    tryInject();
+    const observer = new MutationObserver(tryInject);
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
   // src/plugin.ts
   var TICKS_PER_MS = 1e4;
   var VOLUME_EXPONENT = 3;
   var TIMEUPDATE_INTERVAL_MS = 1e3;
   var BLOCKING_LOOKAHEAD_THRESHOLD_MS = 3e4;
-  var LOG_PREFIX = "[GaplessPlayer]";
-  var SETTING_ENABLED = "enableWebAudioGapless";
+  var LOG_PREFIX2 = "[GaplessPlayer]";
+  var SETTING_ENABLED2 = "enableWebAudioGapless";
   var SETTING_DEBUG = "enableWebAudioGaplessDebug";
   var SETTING_VOLUME = "volume";
   function getAudioContextConstructor() {
@@ -41,7 +157,7 @@
     return window.__gaplessCors === true;
   }
   var WebAudioGaplessPlayer = class {
-    constructor(deps) {
+    constructor(deps2) {
       this.name = "Web Audio Gapless Player";
       this.type = "mediaplayer";
       this.id = "webaudiogaplessplayer";
@@ -75,16 +191,17 @@
       this._audioContext = null;
       this._gainNode = null;
       this._timeUpdateInterval = null;
-      this._events = deps.events;
-      this._appSettings = deps.appSettings;
-      this._playbackManager = deps.playbackManager;
-      this._appHost = deps.appHost;
+      this._events = deps2.events;
+      this._appSettings = deps2.appSettings;
+      this._playbackManager = deps2.playbackManager;
+      this._appHost = deps2.appHost;
       this._volume = this.getSavedVolumeLevel();
+      setToggleDeps(deps2);
     }
     // --- Local settings (localStorage via appSettings) ---------------------
     /** Installed = enabled: default true when the setting has never been set. */
     isGaplessEnabled() {
-      const value = this._appSettings.get(SETTING_ENABLED);
+      const value = this._appSettings.get(SETTING_ENABLED2);
       return value == null ? true : value === "true";
     }
     isDebugEnabled() {
@@ -104,9 +221,9 @@
         return;
       }
       if (data === void 0) {
-        console.debug(`${LOG_PREFIX} ${message}`);
+        console.debug(`${LOG_PREFIX2} ${message}`);
       } else {
-        console.debug(`${LOG_PREFIX} ${message}`, data);
+        console.debug(`${LOG_PREFIX2} ${message}`, data);
       }
     }
     // --- Player contract ---------------------------------------------------
@@ -186,7 +303,7 @@
       this._clearPlaylistState();
       if (this._audioContext) {
         this._audioContext.close().catch((err) => {
-          console.warn(`${LOG_PREFIX} failed to close AudioContext`, err);
+          console.warn(`${LOG_PREFIX2} failed to close AudioContext`, err);
         });
         this._audioContext = null;
       }
@@ -217,7 +334,7 @@
     currentTime(val) {
       if (val != null) {
         this._seekToMs(val).catch((err) => {
-          console.error(`${LOG_PREFIX} failed to seek`, err);
+          console.error(`${LOG_PREFIX2} failed to seek`, err);
         });
       }
       return this.getCurrentTimeMs();
@@ -576,7 +693,7 @@
       }
       this._decodeIndex(nextIndex).catch((err) => {
         if (!isAbortError(err)) {
-          console.warn(`${LOG_PREFIX} failed to preload next item`, err);
+          console.warn(`${LOG_PREFIX2} failed to preload next item`, err);
         }
       });
     }
@@ -656,7 +773,7 @@
         await this._decodeIndex(nextIndex);
       } catch (err) {
         if (!isAbortError(err)) {
-          console.warn(`${LOG_PREFIX} failed to decode next item before boundary`, err);
+          console.warn(`${LOG_PREFIX2} failed to decode next item before boundary`, err);
         }
       }
     }
@@ -720,7 +837,7 @@
         return;
       }
       if (!isNextScheduled && !isNextDecoded) {
-        console.warn(`${LOG_PREFIX} boundary missed; recovering in place`, {
+        console.warn(`${LOG_PREFIX2} boundary missed; recovering in place`, {
           index,
           nextIndex,
           currentTime: audioContext.currentTime,
@@ -772,7 +889,7 @@
         if (isAbortError(err) || playbackId !== this._playbackId) {
           return;
         }
-        console.error(`${LOG_PREFIX} failed to recover gapless playback`, err);
+        console.error(`${LOG_PREFIX2} failed to recover gapless playback`, err);
         this._handoffToNormalPlayback(index);
       });
     }
@@ -787,7 +904,7 @@
         startIndex: 0,
         enableWebAudioGapless: false
       }).catch((err) => {
-        console.error(`${LOG_PREFIX} failed to hand off to normal playback`, err);
+        console.error(`${LOG_PREFIX2} failed to hand off to normal playback`, err);
       });
     }
     _scheduleLookaheadForCurrent() {
@@ -921,4 +1038,9 @@
 
   // src/index.ts
   window.GaplessPlayer = async () => plugin_default;
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initToggleUi);
+  } else {
+    initToggleUi();
+  }
 })();

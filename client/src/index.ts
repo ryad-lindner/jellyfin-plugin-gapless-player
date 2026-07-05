@@ -1,4 +1,5 @@
 import WebAudioGaplessPlayer from './plugin';
+import { initToggleUi } from './toggle';
 
 /**
  * The Jellyfin web client loads a plugin registered on `window` by:
@@ -18,3 +19,11 @@ declare global {
 }
 
 window.GaplessPlayer = async () => WebAudioGaplessPlayer;
+
+// The now-playing bar toggle is independent of the player instance, so wire it
+// up as soon as the bundle loads.
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initToggleUi);
+} else {
+    initToggleUi();
+}
