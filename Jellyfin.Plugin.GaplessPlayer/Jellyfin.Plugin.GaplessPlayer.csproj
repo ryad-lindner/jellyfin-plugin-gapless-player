@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Jellyfin.Plugin.GaplessPlayer</RootNamespace>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+
+    <!-- Per-target defaults (Jellyfin 12 line). Override on the command line
+         for the Jellyfin 10.11 build:
+           -p:JellyfinTfm=net8.0 -p:JellyfinAbiVersion=10.11.11
+         Jellyfin 12 targets net10.0; Jellyfin 10.11 targets net8.0.
+         An intermediate property is used because MSBuild special-cases a
+         global TargetFramework and strips it from the outer build. -->
+    <JellyfinTfm Condition="'$(JellyfinTfm)' == ''">net10.0</JellyfinTfm>
+    <TargetFramework>$(JellyfinTfm)</TargetFramework>
+    <JellyfinAbiVersion Condition="'$(JellyfinAbiVersion)' == ''">12.0.0-rc2</JellyfinAbiVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinAbiVersion)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinAbiVersion)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Configuration\configPage.html" />
+    <EmbeddedResource Include="Configuration\configPage.html" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Built client bundle (produced by the client build before packaging).
+         A committed placeholder keeps the C# build self-contained. -->
+    <None Remove="Web\gaplessPlayer.js" />
+    <EmbeddedResource Include="Web\gaplessPlayer.js" />
+  </ItemGroup>
+
+</Project>

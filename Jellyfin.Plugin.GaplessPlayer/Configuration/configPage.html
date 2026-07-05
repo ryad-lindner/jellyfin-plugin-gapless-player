@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Gapless Player</title>
+</head>
+<body>
+<div id="gaplessPlayerConfigPage" data-role="page" class="page type-interior pluginConfigurationPage"
+     data-require="emby-input,emby-button,emby-checkbox">
+    <div data-role="content">
+        <div class="content-primary">
+            <form id="gaplessPlayerConfigForm">
+                <div class="verticalSection">
+                    <h2 class="sectionTitle">Gapless Player</h2>
+                    <p class="fieldDescription">
+                        Gapless Web Audio playback for eligible direct-play audio queues.
+                        Per-browser enable/disable is available in the player itself; the
+                        options below are server-wide defaults.
+                    </p>
+                </div>
+
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="Enabled" />
+                        <span>Inject the gapless player into the web client</span>
+                    </label>
+                    <div class="fieldDescription checkboxFieldDescription">
+                        Master switch. When off, the plugin does not modify the web client
+                        and the feature is fully disabled. Requires a server restart to take
+                        effect (injection runs at startup).
+                    </div>
+                </div>
+
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="DebugLogging" />
+                        <span>Verbose client debug logging (default for new browsers)</span>
+                    </label>
+                </div>
+
+                <div>
+                    <button is="emby-button" type="submit" class="raised button-submit block">
+                        <span>Save</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script type="text/javascript">
+        (function () {
+            var pluginId = '399b650e-cca7-4f06-95a1-6b55f6fededc';
+
+            document.querySelector('#gaplessPlayerConfigPage')
+                .addEventListener('pageshow', function () {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        document.querySelector('#Enabled').checked = config.Enabled;
+                        document.querySelector('#DebugLogging').checked = config.DebugLogging;
+                        Dashboard.hideLoadingMsg();
+                    });
+                });
+
+            document.querySelector('#gaplessPlayerConfigForm')
+                .addEventListener('submit', function (e) {
+                    e.preventDefault();
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        config.Enabled = document.querySelector('#Enabled').checked;
+                        config.DebugLogging = document.querySelector('#DebugLogging').checked;
+                        ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        });
+                    });
+                    return false;
+                });
+        })();
+    </script>
+</div>
+</body>
+</html>

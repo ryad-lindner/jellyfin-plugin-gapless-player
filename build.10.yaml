@@ -1,0 +1,21 @@
+---
+name: "Gapless Player"
+guid: "399b650e-cca7-4f06-95a1-6b55f6fededc"
+version: "0.1.0.0"
+targetAbi: "10.11.11.0"
+framework: "net9.0"
+overview: "Gapless Web Audio playback for eligible audio queues."
+description: >
+  Adds an experimental local Web Audio player to the Jellyfin web client that
+  plays eligible direct-play audio queues gaplessly by decoding and scheduling
+  adjacent tracks on a shared AudioContext timeline. The stock HTML audio player
+  remains the fallback. The plugin injects its client bundle into the served web
+  client on startup.
+category: "General"
+owner: "ryad-lindner"
+artifacts:
+- "Jellyfin.Plugin.GaplessPlayer.dll"
+changelog: >
+  0.1.0.0: Initial scaffold. Ported gapless player from the jellyfin-web fork;
+  startup disk-patch injection into the served web client.
+---

@@ -1,0 +1,19 @@
+# .NET
+bin/
+obj/
+*.user
+
+# Node / client build
+client/node_modules/
+client/dist/
+
+# NOTE: Jellyfin.Plugin.GaplessPlayer/Web/gaplessPlayer.js is a committed build
+# artifact (produced by `client/` via esbuild) so the C# build is self-contained.
+
+# Packaging output
+artifacts/
+*.zip
+
+# Editor
+.vs/
+.idea/
