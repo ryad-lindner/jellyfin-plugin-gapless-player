@@ -120,6 +120,14 @@ compatible build. `scripts/build.sh` produces the per-major zips and their md5
 checksums for the manifest. Manifest hosting/URLs are deployment config and are
 kept out of this repo.
 
+## Release policy
+
+Only the latest release is kept — each version bump deletes the previous
+release + tag (GitHub and Gitea) and the manifests list a single version. Because
+there is no version history on the release page, the GitHub release notes and the
+manifest `changelog` field describe the **whole feature set**, not the delta from
+the previous version. Update both when cutting a release.
+
 ## Not done yet / TODO
 
 - In-player quick-toggle button (DOM injection into the now-playing bar). Design
