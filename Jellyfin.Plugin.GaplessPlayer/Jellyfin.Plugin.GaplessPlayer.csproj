@@ -17,6 +17,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Needed for the injection middleware (IStartupFilter, HttpContext).
+         The shared framework is present in the Jellyfin runtime. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinAbiVersion)">
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>

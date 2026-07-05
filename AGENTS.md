@@ -33,13 +33,25 @@ So the server plugin must, against the served web assets:
 - add `"GaplessPlayer"` to `config.json` `plugins`,
 - place the bundle at `<webroot>/GaplessPlayer/gaplessPlayer.js`.
 
-`WebInjectionService` (an `IHostedService`) does all three on startup. It is a
-**disk patch**, chosen over the File Transformation plugin because FT has no
-build for the Jellyfin 12 ABI yet, and on an immutable container image the web
-root resets on recreate so a startup patch is self-healing. The patch is
-idempotent. If we later want read-only-webroot support or public distribution, a
-File Transformation reflection path can be added as an optional, preferred
-mechanism (see the jellyfin-web fork's HANDOFF for the research).
+This is done by **in-memory response rewriting**, not a disk patch:
+`GaplessInjectionMiddleware` (inserted via `GaplessInjectionStartupFilter`, an
+`IStartupFilter` registered in `PluginServiceRegistrator`) intercepts the
+`index.html` and `config.json` responses and rewrites them, and serves the
+bundle from the embedded resource at `/.../GaplessPlayer/gaplessPlayer.js`.
+
+History: the first attempt disk-patched the web root on startup. That fails on
+the official container image — the web dir is read-only to the runtime user
+(`UnauthorizedAccessException` creating `<webroot>/GaplessPlayer`). The middleware
+approach needs no write access and is what File Transformation does generically;
+FT itself has no Jellyfin 12 build yet, so we do the specific rewrite ourselves.
+Enable/disable is live because the middleware checks `Plugin.Instance.Configuration.Enabled`
+per request (a web-client reload applies it; no server restart).
+
+Middleware notes: it strips `Accept-Encoding`/conditional headers on the
+intercepted requests to force a full uncompressed 200, buffers the response,
+rewrites by content-type (`text/html` → inject `<script>` before `</head>`;
+`config.json` → add `"GaplessPlayer"` to `plugins`), then fixes Content-Length
+and drops ETag. Requires `<FrameworkReference Include="Microsoft.AspNetCore.App" />`.
 
 ## Player invariants — DO NOT BREAK
 

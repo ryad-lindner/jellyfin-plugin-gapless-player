@@ -19,10 +19,11 @@ without gaps. The normal HTML audio player stays as the fallback.
 - Eligibility: local browser player, direct-playable audio the browser can
   decode with `decodeAudioData`, known finite track durations, more than one
   track in the queue.
-- The server plugin injects the client bundle into the served web client on
-  startup by patching the on-disk web assets (`index.html` + `config.json`) and
-  dropping the bundle next to them. The patch is idempotent and re-applied every
-  start, so it is self-healing on immutable container images.
+- The server plugin injects the client bundle into the served web client by
+  rewriting the `index.html` and `config.json` **responses** in-memory (ASP.NET
+  middleware) and serving the bundle from the plugin. Nothing is written to the
+  web root, so it works on the official image where the web directory is
+  read-only to the runtime user, and enable/disable is live.
 
 ## Requirements
 
@@ -40,9 +41,12 @@ injection runs.
    - Jellyfin **12.x**: `<your-repo-base>/manifest.json`
    - Jellyfin **10.11.x**: `<your-repo-base>/manifest-10.json`
 3. **Dashboard → Plugins → Catalog → Gapless Player → Install**.
-4. **Restart the server.** Injection into the web client runs at startup.
-5. Hard-refresh the web client (clear cache) so the patched `index.html` and
+4. **Restart the server** once, so Jellyfin loads the plugin assembly.
+5. Hard-refresh the web client (clear cache) so the rewritten `index.html` and
    `config.json` are reloaded.
+
+Injection itself is live (response rewriting); only the initial plugin load and
+later enable/disable toggles need a web-client reload, not a server restart.
 
 Each Jellyfin major has its own build and its own manifest, so a server only
 ever sees a compatible version.
