@@ -46,8 +46,14 @@
     button.style.opacity = enabled ? "1" : "0.4";
     const icon = button.querySelector(".material-icons");
     if (icon) {
-      icon.textContent = "graphic_eq";
+      icon.textContent = "all_inclusive";
     }
+  }
+  function stripPresetSource(item) {
+    const clone = { ...item };
+    delete clone.PresetMediaSource;
+    delete clone.Url;
+    return clone;
   }
   async function restartCurrentQueue(enabled) {
     const pm = deps?.playbackManager;
@@ -58,10 +64,11 @@
       if (typeof pm.isPlaying === "function" && !pm.isPlaying()) {
         return false;
       }
-      const items = typeof pm.getPlaylist === "function" ? await pm.getPlaylist() : null;
-      if (!Array.isArray(items) || items.length === 0) {
+      const raw = typeof pm.getPlaylist === "function" ? await pm.getPlaylist() : null;
+      if (!Array.isArray(raw) || raw.length === 0) {
         return false;
       }
+      const items = enabled ? raw : raw.map((it) => stripPresetSource(it));
       const index = typeof pm.getCurrentPlaylistIndex === "function" ? Number(pm.getCurrentPlaylistIndex()) : 0;
       const positionMs = typeof pm.currentTime === "function" ? Number(pm.currentTime()) : 0;
       await pm.play({
@@ -90,7 +97,7 @@
     button.type = "button";
     button.className = `${BUTTON_CLASS} paper-icon-button-light mediaButton`;
     button.setAttribute("is", "paper-icon-button-light");
-    button.innerHTML = '<span class="material-icons" aria-hidden="true">graphic_eq</span>';
+    button.innerHTML = '<span class="material-icons" aria-hidden="true">all_inclusive</span>';
     button.addEventListener("click", () => onClick(button));
     updateButton(button);
     return button;
@@ -146,6 +153,12 @@
   }
   function isGaplessItem(item) {
     return item != null;
+  }
+  function stripPresetSource2(item) {
+    const clone = { ...item };
+    delete clone.PresetMediaSource;
+    delete clone.Url;
+    return clone;
   }
   function isAbortError(err) {
     return err instanceof Error && err.name === "AbortError";
@@ -906,7 +919,7 @@
       });
     }
     _handoffToNormalPlayback(startIndex, startPositionTicks = 0) {
-      const items = this._playlist.slice(startIndex);
+      const items = this._playlist.slice(startIndex).map(stripPresetSource2);
       this._isPaused = true;
       this._stopScheduledSources();
       this._stopTimeUpdates();

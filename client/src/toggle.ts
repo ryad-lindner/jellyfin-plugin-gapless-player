@@ -43,8 +43,19 @@ function updateButton(button: HTMLElement): void {
     button.style.opacity = enabled ? '1' : '0.4';
     const icon = button.querySelector('.material-icons');
     if (icon) {
-        icon.textContent = 'graphic_eq';
+        icon.textContent = 'all_inclusive';
     }
+}
+
+/**
+ * Removes the gapless-only stream source so the normal player resolves a fresh
+ * media source when the queue is restarted with gapless disabled.
+ */
+function stripPresetSource(item: Record<string, unknown>): Record<string, unknown> {
+    const clone = { ...item };
+    delete clone.PresetMediaSource;
+    delete clone.Url;
+    return clone;
 }
 
 async function restartCurrentQueue(enabled: boolean): Promise<boolean> {
@@ -58,10 +69,14 @@ async function restartCurrentQueue(enabled: boolean): Promise<boolean> {
             return false;
         }
 
-        const items = typeof pm.getPlaylist === 'function' ? await (pm.getPlaylist() as Promise<unknown[]>) : null;
-        if (!Array.isArray(items) || items.length === 0) {
+        const raw = typeof pm.getPlaylist === 'function' ? await (pm.getPlaylist() as Promise<unknown[]>) : null;
+        if (!Array.isArray(raw) || raw.length === 0) {
             return false;
         }
+
+        // When switching to the normal player, strip the gapless preset source
+        // so it resolves a fresh media source instead of the raw stream URL.
+        const items = enabled ? raw : raw.map(it => stripPresetSource(it as Record<string, unknown>));
 
         const index = typeof pm.getCurrentPlaylistIndex === 'function' ? Number(pm.getCurrentPlaylistIndex()) : 0;
         const positionMs = typeof pm.currentTime === 'function' ? Number(pm.currentTime()) : 0;
@@ -95,7 +110,7 @@ function createButton(): HTMLElement {
     button.type = 'button';
     button.className = `${BUTTON_CLASS} paper-icon-button-light mediaButton`;
     button.setAttribute('is', 'paper-icon-button-light');
-    button.innerHTML = '<span class="material-icons" aria-hidden="true">graphic_eq</span>';
+    button.innerHTML = '<span class="material-icons" aria-hidden="true">all_inclusive</span>';
     button.addEventListener('click', () => onClick(button));
     updateButton(button);
     return button;

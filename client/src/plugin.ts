@@ -80,6 +80,18 @@ function isGaplessItem(item: GaplessItem | null | undefined): item is GaplessIte
     return item != null;
 }
 
+/**
+ * Returns a copy of the item without the gapless-only stream source, so
+ * playbackManager re-resolves the media source through the normal path when
+ * handing playback to the fallback player.
+ */
+export function stripPresetSource(item: GaplessItem): GaplessItem {
+    const clone = { ...item };
+    delete clone.PresetMediaSource;
+    delete clone.Url;
+    return clone;
+}
+
 function isAbortError(err: unknown): boolean {
     return err instanceof Error && err.name === 'AbortError';
 }
@@ -1067,7 +1079,10 @@ class WebAudioGaplessPlayer {
     }
 
     private _handoffToNormalPlayback(startIndex: number, startPositionTicks = 0): void {
-        const items = this._playlist.slice(startIndex);
+        // Drop the gapless preset source so the normal player resolves a fresh
+        // media source (correct container/transcode decision) instead of
+        // replaying the raw stream URL we decoded for Web Audio.
+        const items = this._playlist.slice(startIndex).map(stripPresetSource);
         this._isPaused = true;
         this._stopScheduledSources();
         this._stopTimeUpdates();
