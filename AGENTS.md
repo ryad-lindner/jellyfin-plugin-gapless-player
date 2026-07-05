@@ -122,11 +122,23 @@ kept out of this repo.
 
 ## Release policy
 
-Only the latest release is kept — each version bump deletes the previous
-release + tag (GitHub and Gitea) and the manifests list a single version. Because
-there is no version history on the release page, the GitHub release notes and the
-manifest `changelog` field describe the **whole feature set**, not the delta from
-the previous version. Update both when cutting a release.
+Two phases:
+
+**Stabilization (current).** Until there is one accepted, working release, keep
+only the latest: each bump deletes the previous release + tag (GitHub and Gitea)
+and the manifests list a single version. Intermediate builds during this phase
+are bug-fix iterations, not milestones worth preserving. Because there is no
+version history on the release page, the GitHub release notes and the manifest
+`changelog` describe the **whole feature set**, not the delta.
+
+**Normal versioning (once a first stable release is accepted).** Stop deleting
+old releases; keep version history in the manifest (append new version entries,
+newest first), and let each release's notes/`changelog` describe the **changes in
+that version** (delta). New features then ship as new versions alongside the
+existing ones.
+
+We are in the stabilization phase now; switch to normal versioning once the
+current release is confirmed working end-to-end.
 
 ## Not done yet / TODO
 
