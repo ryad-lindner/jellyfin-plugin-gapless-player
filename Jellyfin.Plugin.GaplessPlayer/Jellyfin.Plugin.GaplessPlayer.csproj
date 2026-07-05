@@ -2,8 +2,8 @@
 
   <PropertyGroup>
     <RootNamespace>Jellyfin.Plugin.GaplessPlayer</RootNamespace>
-    <AssemblyVersion>0.1.0.2</AssemblyVersion>
-    <FileVersion>0.1.0.2</FileVersion>
+    <AssemblyVersion>0.1.0.3</AssemblyVersion>
+    <FileVersion>0.1.0.3</FileVersion>
 
     <!-- Per-target defaults (Jellyfin 12 line). Override on the command line
          for the Jellyfin 10.11 build:

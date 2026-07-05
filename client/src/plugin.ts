@@ -90,6 +90,29 @@ function randomInt(min: number, max: number): number {
 }
 
 /**
+ * Strips a leading ID3v2 tag if present. Browsers' decodeAudioData requires the
+ * container magic (e.g. "fLaC") at byte 0 and fails on ID3-prefixed files,
+ * which are common on tagged FLAC rips; ffmpeg/<audio> skip the tag but Web
+ * Audio does not. Returns the original buffer when there is no ID3 header.
+ */
+function stripLeadingId3(buffer: ArrayBuffer): ArrayBuffer {
+    const bytes = new Uint8Array(buffer);
+    // "ID3"
+    if (bytes.length < 10 || bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) {
+        return buffer;
+    }
+
+    // Syncsafe 28-bit size (7 bits per byte), plus the 10-byte header, plus a
+    // 10-byte footer when the footer flag (bit 4 of the flags byte) is set.
+    const size = ((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14)
+        | ((bytes[8] & 0x7f) << 7) | (bytes[9] & 0x7f);
+    const hasFooter = (bytes[5] & 0x10) !== 0;
+    const start = 10 + size + (hasFooter ? 10 : 0);
+
+    return start < bytes.length ? buffer.slice(start) : buffer;
+}
+
+/**
  * The web client normally derives this from config.json. For a same-origin
  * deployment (web client served by the same server) same-origin credentials
  * are correct; cross-origin setups can override via window.__gaplessCors.
@@ -254,7 +277,13 @@ class WebAudioGaplessPlayer {
                 // Superseded by a newer play/stop request.
                 return;
             }
-            throw err;
+            // The browser could not decode this track (e.g. some high-res
+            // FLAC). Fall back to the normal player instead of rejecting,
+            // which would surface a playback-error dialog. Stock jellyfin-web
+            // has no self-managed-player fallback, so the plugin does it here.
+            console.warn(`${LOG_PREFIX} initial decode failed; handing off to normal playback`, err);
+            this._handoffToNormalPlayback(this._currentIndex, Math.round(this._basePositionMs * TICKS_PER_MS));
+            return;
         }
         this._preloadNext();
         await this._startFrom(this._currentIndex, this._basePositionMs);
@@ -758,7 +787,7 @@ class WebAudioGaplessPlayer {
             throw new Error('AudioContext was closed before decode completed');
         }
 
-        return this._audioContext.decodeAudioData(arrayBuffer);
+        return this._audioContext.decodeAudioData(stripLeadingId3(arrayBuffer));
     }
 
     /**
@@ -1037,7 +1066,7 @@ class WebAudioGaplessPlayer {
             });
     }
 
-    private _handoffToNormalPlayback(startIndex: number): void {
+    private _handoffToNormalPlayback(startIndex: number, startPositionTicks = 0): void {
         const items = this._playlist.slice(startIndex);
         this._isPaused = true;
         this._stopScheduledSources();
@@ -1047,6 +1076,7 @@ class WebAudioGaplessPlayer {
             items,
             fullscreen: this._playOptions.fullscreen,
             startIndex: 0,
+            startPositionTicks,
             enableWebAudioGapless: false
         }).catch((err) => {
             console.error(`${LOG_PREFIX} failed to hand off to normal playback`, err);

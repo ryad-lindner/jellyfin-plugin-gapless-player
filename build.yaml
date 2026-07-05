@@ -1,7 +1,7 @@
 ---
 name: "Gapless Player"
 guid: "399b650e-cca7-4f06-95a1-6b55f6fededc"
-version: "0.1.0.2"
+version: "0.1.0.3"
 targetAbi: "12.0.0.0"
 framework: "net10.0"
 overview: "Gapless Web Audio playback for eligible audio queues."

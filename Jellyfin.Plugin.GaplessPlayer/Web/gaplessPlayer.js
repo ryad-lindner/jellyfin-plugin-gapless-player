@@ -153,6 +153,16 @@
   function randomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
   }
+  function stripLeadingId3(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length < 10 || bytes[0] !== 73 || bytes[1] !== 68 || bytes[2] !== 51) {
+      return buffer;
+    }
+    const size = (bytes[6] & 127) << 21 | (bytes[7] & 127) << 14 | (bytes[8] & 127) << 7 | bytes[9] & 127;
+    const hasFooter = (bytes[5] & 16) !== 0;
+    const start = 10 + size + (hasFooter ? 10 : 0);
+    return start < bytes.length ? buffer.slice(start) : buffer;
+  }
   function getIncludeCorsCredentials() {
     return window.__gaplessCors === true;
   }
@@ -276,7 +286,9 @@
         if (isAbortError(err)) {
           return;
         }
-        throw err;
+        console.warn(`${LOG_PREFIX2} initial decode failed; handing off to normal playback`, err);
+        this._handoffToNormalPlayback(this._currentIndex, Math.round(this._basePositionMs * TICKS_PER_MS));
+        return;
       }
       this._preloadNext();
       await this._startFrom(this._currentIndex, this._basePositionMs);
@@ -667,7 +679,7 @@
       if (!this._audioContext) {
         throw new Error("AudioContext was closed before decode completed");
       }
-      return this._audioContext.decodeAudioData(arrayBuffer);
+      return this._audioContext.decodeAudioData(stripLeadingId3(arrayBuffer));
     }
     /**
      * Resolves the index that should play after the given one, honoring the
@@ -893,7 +905,7 @@
         this._handoffToNormalPlayback(index);
       });
     }
-    _handoffToNormalPlayback(startIndex) {
+    _handoffToNormalPlayback(startIndex, startPositionTicks = 0) {
       const items = this._playlist.slice(startIndex);
       this._isPaused = true;
       this._stopScheduledSources();
@@ -902,6 +914,7 @@
         items,
         fullscreen: this._playOptions.fullscreen,
         startIndex: 0,
+        startPositionTicks,
         enableWebAudioGapless: false
       }).catch((err) => {
         console.error(`${LOG_PREFIX2} failed to hand off to normal playback`, err);
