@@ -4,6 +4,9 @@ import { setToggleDeps } from './toggle';
 const TICKS_PER_MS = 10000;
 const VOLUME_EXPONENT = 3;
 const TIMEUPDATE_INTERVAL_MS = 1000;
+// Repaint cadence for download progress; the now-playing bar throttles
+// timeupdate to 700ms anyway, so finer granularity would be wasted.
+const DOWNLOAD_PROGRESS_EVENT_MS = 500;
 const BLOCKING_LOOKAHEAD_THRESHOLD_MS = 30000;
 const LOG_PREFIX = '[GaplessPlayer]';
 
@@ -96,6 +99,15 @@ function isAbortError(err: unknown): boolean {
     return err instanceof Error && err.name === 'AbortError';
 }
 
+/**
+ * Identity key for "is this the same queue entry" checks across playlist
+ * mutations, where the index alone is not stable. Items lacking both ids are
+ * indistinguishable and compare as equal.
+ */
+function itemKey(item?: GaplessItem | null): string | null {
+    return item?.PlaylistItemId ?? item?.Id ?? null;
+}
+
 /** Inclusive random integer in [min, max]. Mirrors jellyfin-web utils/number. */
 function randomInt(min: number, max: number): number {
     return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -153,6 +165,16 @@ class WebAudioGaplessPlayer {
     private _decoded = new Map<number, AudioBuffer>();
     private _decoding = new Map<number, Promise<AudioBuffer>>();
     private _decodeAborts = new Map<number, AbortController>();
+    private _downloadProgress = new Map<number, { loaded: number; total: number }>();
+    // Item for which an optimistic itemstarted was fired (so the now-playing
+    // bar appears and paints download progress) but audio has not started yet.
+    // Non-null only during the initial load window of play().
+    private _loadingItem: GaplessItem | null = null;
+    // Key of the item the last itemstarted was fired for; lets _startFrom
+    // detect that the item under _currentIndex changed (e.g. remove-current)
+    // even when the index did not.
+    private _startedItemKey: string | null = null;
+    private _lastProgressTriggerMs = 0;
     private _scheduled = new Map<number, AudioBufferSourceNode>();
     private _scheduledStartTimes = new Map<number, number>();
     private _schedule = new Map<number, ScheduleEntry>();
@@ -259,6 +281,11 @@ class WebAudioGaplessPlayer {
     }
 
     async play(options: GaplessPlayOptions): Promise<void> {
+        // If a previous play() is still in its load window, its optimistic
+        // itemstarted needs a matching itemstopped (fired below, once the new
+        // current item is known) or the server keeps a dangling play session.
+        const supersededItem = this._loadingItem;
+        this._loadingItem = null;
         await this.stop(false);
 
         this._playOptions = options || {};
@@ -273,6 +300,9 @@ class WebAudioGaplessPlayer {
         this._shuffleMode = 'Sorted';
 
         if (!this._playlist.length) {
+            if (supersededItem) {
+                this._emitItemStopped(supersededItem, null);
+            }
             return Promise.reject(new Error('No items to play'));
         }
 
@@ -280,6 +310,21 @@ class WebAudioGaplessPlayer {
             items: this._playlist.length,
             startIndex: this._currentIndex
         });
+
+        if (supersededItem) {
+            this._emitItemStopped(supersededItem, this.currentItem());
+        }
+
+        // Optimistic itemstarted before the (potentially long) fetch+decode:
+        // the now-playing bar appears immediately and paints download progress
+        // via getBufferedRanges(). _startFrom() then only fires timeupdate for
+        // this index (the _started/previousIndex gate), not a second
+        // itemstarted. Known limits: SyncPlay would see "ready" at position 0,
+        // and pause during the load window is ignored (as before).
+        this._started = true;
+        this._loadingItem = this.currentItem();
+        this._startedItemKey = itemKey(this._loadingItem);
+        this._events.trigger(this, 'itemstarted', [this.currentItem(), this.currentMediaSource()]);
 
         await this._ensureAudioGraph();
         try {
@@ -302,12 +347,15 @@ class WebAudioGaplessPlayer {
     }
 
     stop(destroyPlayer: boolean): Promise<void> {
+        this._abandonOptimisticStart();
         this._playbackId++;
         this._stopScheduledSources();
         this._stopTimeUpdates();
         this._clearDecodedAfterMutation();
         this._isPaused = true;
         this._started = false;
+        this._startedItemKey = null;
+        this._lastProgressTriggerMs = 0;
         this._pausePositionMs = 0;
 
         if (destroyPlayer) {
@@ -319,6 +367,7 @@ class WebAudioGaplessPlayer {
     }
 
     destroy(): void {
+        this._abandonOptimisticStart();
         this._playbackId++;
         this._stopScheduledSources();
         this._stopTimeUpdates();
@@ -360,7 +409,11 @@ class WebAudioGaplessPlayer {
     }
 
     paused(): boolean {
-        return this._isPaused;
+        // During the optimistic load window the track is "playing" from the
+        // user's point of view (play/pause icon, server report), even though
+        // _isPaused is still true and currentTime() stays frozen at the start
+        // position until _startFrom() schedules audio.
+        return this._loadingItem ? false : this._isPaused;
     }
 
     currentTime(val?: number): number {
@@ -391,8 +444,26 @@ class WebAudioGaplessPlayer {
         return true;
     }
 
-    getBufferedRanges(): never[] {
-        return [];
+    getBufferedRanges(): { start: number; end: number }[] {
+        const runTimeTicks = this.currentMediaSource()?.RunTimeTicks || this.currentItem()?.RunTimeTicks;
+        if (!runTimeTicks) {
+            return [];
+        }
+
+        if (this._decoded.has(this._currentIndex)) {
+            return [{ start: 0, end: runTimeTicks }];
+        }
+
+        // Byte fraction as a stand-in for the time fraction (inexact for VBR,
+        // fine for a loading indicator). Without a Content-Length total there
+        // is nothing meaningful to paint.
+        const progress = this._downloadProgress.get(this._currentIndex);
+        if (!progress?.total) {
+            return [];
+        }
+
+        const fraction = Math.min(1, progress.loaded / progress.total);
+        return [{ start: 0, end: Math.floor(runTimeTicks * fraction) }];
     }
 
     seek(positionTicks: number): Promise<void> {
@@ -708,6 +779,35 @@ class WebAudioGaplessPlayer {
             this._decoded.set(newCurrentIndex, currentBuffer);
         }
 
+        if (this._loadingItem) {
+            // The mutation aborted the pending initial decode, so the play()
+            // that fired the optimistic itemstarted bails on its AbortError
+            // and would leave the start unresolved. Restart the load for the
+            // re-keyed current index in its place.
+            const playbackId = this._playbackId;
+            const resumeMs = this._pausePositionMs;
+            this._decodeIndex(newCurrentIndex)
+                .then(() => {
+                    // Re-check the load window besides the playbackId: play()'s
+                    // own _startFrom may already be past its playbackId bump
+                    // (waiting on the boundary decode) and about to start
+                    // audio itself — it closes the window on completion, and
+                    // starting here as well would double-start playback.
+                    if (playbackId !== this._playbackId || !this._loadingItem) {
+                        return Promise.resolve();
+                    }
+                    return this._startFrom(newCurrentIndex, resumeMs);
+                })
+                .catch((err) => {
+                    if (isAbortError(err) || playbackId !== this._playbackId) {
+                        return;
+                    }
+                    console.error(`${LOG_PREFIX} failed to restart load after playlist mutation`, err);
+                    this._handoffToNormalPlayback(newCurrentIndex);
+                });
+            return;
+        }
+
         if (!this._isPaused) {
             this._scheduleLookaheadForCurrent();
             this._preloadNext();
@@ -754,16 +854,29 @@ class WebAudioGaplessPlayer {
         }
 
         const abortController = new AbortController();
-        const decode = this._fetchAndDecode(url, abortController.signal)
+        // Progress updates are validated by _decodeAborts identity, the same
+        // discipline as the _decoding identity check below: a superseded
+        // fetch must not repaint the bar for its index.
+        const onProgress = (loaded: number, total: number): void => {
+            if (this._decodeAborts.get(index) !== abortController) {
+                return;
+            }
+            this._downloadProgress.set(index, { loaded, total });
+            if (index === this._currentIndex) {
+                this._triggerDownloadProgress();
+            }
+        };
+        const decode = this._fetchAndDecode(url, abortController.signal, onProgress)
             .then((audioBuffer) => {
                 // Cache only while this decode is still the registered one for
                 // the index. stop() and playlist mutations clear _decoding to
                 // invalidate stale results; _playbackId must not be used here
-                // because _startFrom() bumps it after preloads were kicked off,
+                // because _startFrom() bumps it after preloads were dispatched,
                 // which would discard every lookahead decode.
                 if (this._decoding.get(index) === decode) {
                     this._decoding.delete(index);
                     this._decodeAborts.delete(index);
+                    this._downloadProgress.delete(index);
                     this._decoded.set(index, audioBuffer);
                     this._scheduleDecodedLookahead(index, audioBuffer);
                     this._pruneDecoded();
@@ -775,6 +888,7 @@ class WebAudioGaplessPlayer {
                 if (this._decoding.get(index) === decode) {
                     this._decoding.delete(index);
                     this._decodeAborts.delete(index);
+                    this._downloadProgress.delete(index);
                 }
                 throw err;
             });
@@ -784,7 +898,11 @@ class WebAudioGaplessPlayer {
         return decode;
     }
 
-    private async _fetchAndDecode(url: string, signal: AbortSignal): Promise<AudioBuffer> {
+    private async _fetchAndDecode(
+        url: string,
+        signal: AbortSignal,
+        onProgress?: (loaded: number, total: number) => void
+    ): Promise<AudioBuffer> {
         const response = await fetch(url, {
             credentials: getIncludeCorsCredentials() ? 'include' : 'same-origin',
             signal
@@ -794,12 +912,52 @@ class WebAudioGaplessPlayer {
             throw new Error(`Failed to fetch gapless audio: ${response.status}`);
         }
 
-        const arrayBuffer = await response.arrayBuffer();
+        const arrayBuffer = await this._readBody(response, onProgress);
         if (!this._audioContext) {
             throw new Error('AudioContext was closed before decode completed');
         }
 
         return this._audioContext.decodeAudioData(stripLeadingId3(arrayBuffer));
+    }
+
+    /**
+     * Reads the response body in chunks so download progress can be reported.
+     * Transcoded universal-audio streams may omit Content-Length; without a
+     * total there is no fraction to report, so read opaquely as before. An
+     * abort of the fetch signal rejects the chunk read with an AbortError,
+     * which callers already treat as "superseded".
+     */
+    private async _readBody(
+        response: Response,
+        onProgress?: (loaded: number, total: number) => void
+    ): Promise<ArrayBuffer> {
+        const total = Number(response.headers.get('Content-Length')) || 0;
+        if (!response.body || !onProgress || total <= 0) {
+            return response.arrayBuffer();
+        }
+
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let loaded = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            chunks.push(value);
+            loaded += value.byteLength;
+            onProgress(loaded, total);
+        }
+
+        const buffer = new ArrayBuffer(loaded);
+        const combined = new Uint8Array(buffer);
+        let offset = 0;
+        for (const chunk of chunks) {
+            combined.set(chunk, offset);
+            offset += chunk.byteLength;
+        }
+
+        return buffer;
     }
 
     /**
@@ -889,8 +1047,22 @@ class WebAudioGaplessPlayer {
         this._preloadNext();
         this._startTimeUpdates();
 
-        if (!this._started || previousIndex !== index) {
+        const startedItem = this.currentItem();
+        const itemChanged = itemKey(startedItem) !== this._startedItemKey;
+        if (itemChanged) {
+            // The item under this index is not the one the last itemstarted
+            // announced (e.g. remove-current mid-load replaced it): close a
+            // pending optimistic start with its itemstopped first.
+            this._abandonOptimisticStart(startedItem);
+        } else {
+            // Audio is scheduled; the optimistic-start window (if any) ends
+            // here without an itemstopped — playback continues on this item.
+            this._loadingItem = null;
+        }
+
+        if (!this._started || previousIndex !== index || itemChanged) {
             this._started = true;
+            this._startedItemKey = itemKey(startedItem);
             this._events.trigger(this, 'itemstarted', [this.currentItem(), this.currentMediaSource()]);
         } else {
             this._events.trigger(this, 'timeupdate');
@@ -1044,6 +1216,7 @@ class WebAudioGaplessPlayer {
             index: this._currentIndex,
             name: this.currentItem()?.Name
         });
+        this._startedItemKey = itemKey(this.currentItem());
         this._events.trigger(this, 'itemstarted', [this.currentItem(), this.currentMediaSource()]);
         this._preloadNext();
         this._pruneDecoded();
@@ -1083,6 +1256,9 @@ class WebAudioGaplessPlayer {
         // media source (correct container/transcode decision) instead of
         // replaying the raw stream URL we decoded for Web Audio.
         const items = this._playlist.slice(startIndex).map(stripPresetSource);
+        // Close a pending optimistic start (nextItem set: the fallback player
+        // continues with the same item, so the now-playing bar must not hide).
+        this._abandonOptimisticStart(this._playlist[startIndex] ?? null);
         this._isPaused = true;
         this._stopScheduledSources();
         this._stopTimeUpdates();
@@ -1138,6 +1314,7 @@ class WebAudioGaplessPlayer {
         this._decodeAborts.clear();
         this._decoded.clear();
         this._decoding.clear();
+        this._downloadProgress.clear();
     }
 
     private _clearPlaylistState(): void {
@@ -1160,6 +1337,12 @@ class WebAudioGaplessPlayer {
         for (const index of this._decoded.keys()) {
             if (!keep.has(index)) {
                 this._decoded.delete(index);
+            }
+        }
+
+        for (const index of this._downloadProgress.keys()) {
+            if (!keep.has(index)) {
+                this._downloadProgress.delete(index);
             }
         }
     }
@@ -1233,6 +1416,43 @@ class WebAudioGaplessPlayer {
         const index = this._playlist.findIndex(i => (currentItemId != null && i.PlaylistItemId === currentItemId)
             || (currentItem?.Id != null && i.Id === currentItem.Id));
         this._currentIndex = Math.max(0, index);
+    }
+
+    /**
+     * Fires the itemstopped that pairs with an optimistic itemstarted whose
+     * audio never started (superseded play, stop, or fallback handoff).
+     * playbackManager only resets its per-item stream state on the next
+     * itemstarted, so skipping this would leave a dangling play session on
+     * the server. No-op outside the load window.
+     */
+    private _abandonOptimisticStart(nextItem: GaplessItem | null = null): void {
+        const item = this._loadingItem;
+        if (!item) {
+            return;
+        }
+
+        this._loadingItem = null;
+        this._emitItemStopped(item, nextItem);
+    }
+
+    private _emitItemStopped(item: GaplessItem, nextItem: GaplessItem | null): void {
+        this._events.trigger(this, 'itemstopped', [{
+            item,
+            mediaSource: getMediaSource(item),
+            positionMs: 0,
+            nextItem: nextItem ? { item: nextItem } : null,
+            nextMediaType: nextItem ? nextItem.MediaType : null
+        }]);
+    }
+
+    private _triggerDownloadProgress(): void {
+        const now = performance.now();
+        if (now - this._lastProgressTriggerMs < DOWNLOAD_PROGRESS_EVENT_MS) {
+            return;
+        }
+
+        this._lastProgressTriggerMs = now;
+        this._events.trigger(this, 'timeupdate');
     }
 
     private _startTimeUpdates(): void {

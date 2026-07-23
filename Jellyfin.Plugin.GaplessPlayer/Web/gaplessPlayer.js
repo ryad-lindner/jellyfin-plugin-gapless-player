@@ -127,6 +127,7 @@
   var TICKS_PER_MS = 1e4;
   var VOLUME_EXPONENT = 3;
   var TIMEUPDATE_INTERVAL_MS = 1e3;
+  var DOWNLOAD_PROGRESS_EVENT_MS = 500;
   var BLOCKING_LOOKAHEAD_THRESHOLD_MS = 3e4;
   var LOG_PREFIX2 = "[GaplessPlayer]";
   var SETTING_ENABLED2 = "enableWebAudioGapless";
@@ -163,6 +164,9 @@
   function isAbortError(err) {
     return err instanceof Error && err.name === "AbortError";
   }
+  function itemKey(item) {
+    return item?.PlaylistItemId ?? item?.Id ?? null;
+  }
   function randomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
   }
@@ -194,6 +198,16 @@
       this._decoded = /* @__PURE__ */ new Map();
       this._decoding = /* @__PURE__ */ new Map();
       this._decodeAborts = /* @__PURE__ */ new Map();
+      this._downloadProgress = /* @__PURE__ */ new Map();
+      // Item for which an optimistic itemstarted was fired (so the now-playing
+      // bar appears and paints download progress) but audio has not started yet.
+      // Non-null only during the initial load window of play().
+      this._loadingItem = null;
+      // Key of the item the last itemstarted was fired for; lets _startFrom
+      // detect that the item under _currentIndex changed (e.g. remove-current)
+      // even when the index did not.
+      this._startedItemKey = null;
+      this._lastProgressTriggerMs = 0;
       this._scheduled = /* @__PURE__ */ new Map();
       this._scheduledStartTimes = /* @__PURE__ */ new Map();
       this._schedule = /* @__PURE__ */ new Map();
@@ -275,6 +289,8 @@
       return {};
     }
     async play(options) {
+      const supersededItem = this._loadingItem;
+      this._loadingItem = null;
       await this.stop(false);
       this._playOptions = options || {};
       this._playlist = clonePlaylistItems(options.items || [options.item].filter(isGaplessItem));
@@ -286,12 +302,22 @@
       this._repeatMode = "RepeatNone";
       this._shuffleMode = "Sorted";
       if (!this._playlist.length) {
+        if (supersededItem) {
+          this._emitItemStopped(supersededItem, null);
+        }
         return Promise.reject(new Error("No items to play"));
       }
       this.debugLog("starting gapless queue", {
         items: this._playlist.length,
         startIndex: this._currentIndex
       });
+      if (supersededItem) {
+        this._emitItemStopped(supersededItem, this.currentItem());
+      }
+      this._started = true;
+      this._loadingItem = this.currentItem();
+      this._startedItemKey = itemKey(this._loadingItem);
+      this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
       await this._ensureAudioGraph();
       try {
         await this._decodeIndex(this._currentIndex);
@@ -307,12 +333,15 @@
       await this._startFrom(this._currentIndex, this._basePositionMs);
     }
     stop(destroyPlayer) {
+      this._abandonOptimisticStart();
       this._playbackId++;
       this._stopScheduledSources();
       this._stopTimeUpdates();
       this._clearDecodedAfterMutation();
       this._isPaused = true;
       this._started = false;
+      this._startedItemKey = null;
+      this._lastProgressTriggerMs = 0;
       this._pausePositionMs = 0;
       if (destroyPlayer) {
         this._clearPlaylistState();
@@ -321,6 +350,7 @@
       return Promise.resolve();
     }
     destroy() {
+      this._abandonOptimisticStart();
       this._playbackId++;
       this._stopScheduledSources();
       this._stopTimeUpdates();
@@ -354,7 +384,7 @@
       return this._startFrom(this._currentIndex, this._pausePositionMs);
     }
     paused() {
-      return this._isPaused;
+      return this._loadingItem ? false : this._isPaused;
     }
     currentTime(val) {
       if (val != null) {
@@ -378,7 +408,19 @@
       return true;
     }
     getBufferedRanges() {
-      return [];
+      const runTimeTicks = this.currentMediaSource()?.RunTimeTicks || this.currentItem()?.RunTimeTicks;
+      if (!runTimeTicks) {
+        return [];
+      }
+      if (this._decoded.has(this._currentIndex)) {
+        return [{ start: 0, end: runTimeTicks }];
+      }
+      const progress = this._downloadProgress.get(this._currentIndex);
+      if (!progress?.total) {
+        return [];
+      }
+      const fraction = Math.min(1, progress.loaded / progress.total);
+      return [{ start: 0, end: Math.floor(runTimeTicks * fraction) }];
     }
     seek(positionTicks) {
       return this._seekToMs(positionTicks / TICKS_PER_MS);
@@ -621,6 +663,23 @@
       if (currentBuffer) {
         this._decoded.set(newCurrentIndex, currentBuffer);
       }
+      if (this._loadingItem) {
+        const playbackId = this._playbackId;
+        const resumeMs = this._pausePositionMs;
+        this._decodeIndex(newCurrentIndex).then(() => {
+          if (playbackId !== this._playbackId || !this._loadingItem) {
+            return Promise.resolve();
+          }
+          return this._startFrom(newCurrentIndex, resumeMs);
+        }).catch((err) => {
+          if (isAbortError(err) || playbackId !== this._playbackId) {
+            return;
+          }
+          console.error(`${LOG_PREFIX2} failed to restart load after playlist mutation`, err);
+          this._handoffToNormalPlayback(newCurrentIndex);
+        });
+        return;
+      }
       if (!this._isPaused) {
         this._scheduleLookaheadForCurrent();
         this._preloadNext();
@@ -660,10 +719,20 @@
         throw new Error("Gapless item has no stream URL");
       }
       const abortController = new AbortController();
-      const decode = this._fetchAndDecode(url, abortController.signal).then((audioBuffer) => {
+      const onProgress = (loaded, total) => {
+        if (this._decodeAborts.get(index) !== abortController) {
+          return;
+        }
+        this._downloadProgress.set(index, { loaded, total });
+        if (index === this._currentIndex) {
+          this._triggerDownloadProgress();
+        }
+      };
+      const decode = this._fetchAndDecode(url, abortController.signal, onProgress).then((audioBuffer) => {
         if (this._decoding.get(index) === decode) {
           this._decoding.delete(index);
           this._decodeAborts.delete(index);
+          this._downloadProgress.delete(index);
           this._decoded.set(index, audioBuffer);
           this._scheduleDecodedLookahead(index, audioBuffer);
           this._pruneDecoded();
@@ -673,6 +742,7 @@
         if (this._decoding.get(index) === decode) {
           this._decoding.delete(index);
           this._decodeAborts.delete(index);
+          this._downloadProgress.delete(index);
         }
         throw err;
       });
@@ -680,7 +750,7 @@
       this._decodeAborts.set(index, abortController);
       return decode;
     }
-    async _fetchAndDecode(url, signal) {
+    async _fetchAndDecode(url, signal, onProgress) {
       const response = await fetch(url, {
         credentials: getIncludeCorsCredentials() ? "include" : "same-origin",
         signal
@@ -688,11 +758,44 @@
       if (!response.ok) {
         throw new Error(`Failed to fetch gapless audio: ${response.status}`);
       }
-      const arrayBuffer = await response.arrayBuffer();
+      const arrayBuffer = await this._readBody(response, onProgress);
       if (!this._audioContext) {
         throw new Error("AudioContext was closed before decode completed");
       }
       return this._audioContext.decodeAudioData(stripLeadingId3(arrayBuffer));
+    }
+    /**
+     * Reads the response body in chunks so download progress can be reported.
+     * Transcoded universal-audio streams may omit Content-Length; without a
+     * total there is no fraction to report, so read opaquely as before. An
+     * abort of the fetch signal rejects the chunk read with an AbortError,
+     * which callers already treat as "superseded".
+     */
+    async _readBody(response, onProgress) {
+      const total = Number(response.headers.get("Content-Length")) || 0;
+      if (!response.body || !onProgress || total <= 0) {
+        return response.arrayBuffer();
+      }
+      const reader = response.body.getReader();
+      const chunks = [];
+      let loaded = 0;
+      for (; ; ) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        chunks.push(value);
+        loaded += value.byteLength;
+        onProgress(loaded, total);
+      }
+      const buffer = new ArrayBuffer(loaded);
+      const combined = new Uint8Array(buffer);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return buffer;
     }
     /**
      * Resolves the index that should play after the given one, honoring the
@@ -765,8 +868,16 @@
       }
       this._preloadNext();
       this._startTimeUpdates();
-      if (!this._started || previousIndex !== index) {
+      const startedItem = this.currentItem();
+      const itemChanged = itemKey(startedItem) !== this._startedItemKey;
+      if (itemChanged) {
+        this._abandonOptimisticStart(startedItem);
+      } else {
+        this._loadingItem = null;
+      }
+      if (!this._started || previousIndex !== index || itemChanged) {
         this._started = true;
+        this._startedItemKey = itemKey(startedItem);
         this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
       } else {
         this._events.trigger(this, "timeupdate");
@@ -891,6 +1002,7 @@
         index: this._currentIndex,
         name: this.currentItem()?.Name
       });
+      this._startedItemKey = itemKey(this.currentItem());
       this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
       this._preloadNext();
       this._pruneDecoded();
@@ -920,6 +1032,7 @@
     }
     _handoffToNormalPlayback(startIndex, startPositionTicks = 0) {
       const items = this._playlist.slice(startIndex).map(stripPresetSource2);
+      this._abandonOptimisticStart(this._playlist[startIndex] ?? null);
       this._isPaused = true;
       this._stopScheduledSources();
       this._stopTimeUpdates();
@@ -966,6 +1079,7 @@
       this._decodeAborts.clear();
       this._decoded.clear();
       this._decoding.clear();
+      this._downloadProgress.clear();
     }
     _clearPlaylistState() {
       this._playlist = [];
@@ -985,6 +1099,11 @@
       for (const index of this._decoded.keys()) {
         if (!keep.has(index)) {
           this._decoded.delete(index);
+        }
+      }
+      for (const index of this._downloadProgress.keys()) {
+        if (!keep.has(index)) {
+          this._downloadProgress.delete(index);
         }
       }
     }
@@ -1044,6 +1163,38 @@
       this._sortedPlaylist = [];
       const index = this._playlist.findIndex((i) => currentItemId != null && i.PlaylistItemId === currentItemId || currentItem?.Id != null && i.Id === currentItem.Id);
       this._currentIndex = Math.max(0, index);
+    }
+    /**
+     * Fires the itemstopped that pairs with an optimistic itemstarted whose
+     * audio never started (superseded play, stop, or fallback handoff).
+     * playbackManager only resets its per-item stream state on the next
+     * itemstarted, so skipping this would leave a dangling play session on
+     * the server. No-op outside the load window.
+     */
+    _abandonOptimisticStart(nextItem = null) {
+      const item = this._loadingItem;
+      if (!item) {
+        return;
+      }
+      this._loadingItem = null;
+      this._emitItemStopped(item, nextItem);
+    }
+    _emitItemStopped(item, nextItem) {
+      this._events.trigger(this, "itemstopped", [{
+        item,
+        mediaSource: getMediaSource(item),
+        positionMs: 0,
+        nextItem: nextItem ? { item: nextItem } : null,
+        nextMediaType: nextItem ? nextItem.MediaType : null
+      }]);
+    }
+    _triggerDownloadProgress() {
+      const now = performance.now();
+      if (now - this._lastProgressTriggerMs < DOWNLOAD_PROGRESS_EVENT_MS) {
+        return;
+      }
+      this._lastProgressTriggerMs = now;
+      this._events.trigger(this, "timeupdate");
     }
     _startTimeUpdates() {
       this._stopTimeUpdates();
