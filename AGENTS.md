@@ -120,6 +120,43 @@ compatible build. `scripts/build.sh` produces the per-major zips and their md5
 checksums for the manifest. Manifest hosting/URLs are deployment config and are
 kept out of this repo.
 
+## Release steps
+
+Pushes go to the private host; it push-mirrors to the public GitHub repo on
+commit (tags included, usually within seconds). Release assets live on the
+GitHub mirror's releases; the manifests live in a separate plugin-repo repo
+(`manifest.json`, `manifest-10.json`), also mirrored to GitHub.
+
+1. **Client bundle.** If `client/src` changed, rebuild and commit
+   `Web/gaplessPlayer.js` (see the container commands above).
+2. **Bump the version** (4-part, e.g. `0.1.0.6`) in the csproj
+   `AssemblyVersion`/`FileVersion`, `build.yaml` and `build.10.yaml`. Commit
+   `chore: release <version>`, tag annotated `v<version>` with message
+   `Gapless Player <version>`, push `main` and the tag.
+3. **Package**: `CHANGELOG="..." scripts/build.sh`. It builds the committed
+   tree for both majors in SDK containers and prints `sourceUrl`, `checksum`
+   (md5) and `timestamp` per zip. The changelog follows the release policy
+   (whole feature set during stabilization, delta afterwards).
+4. **GitHub release** once the tag has mirrored:
+   `gh release create v<version> --verify-tag --title "Gapless Player <version>"
+   --notes-file <notes> artifacts/*.zip`. Notes: intro line, `## Features`,
+   `## Install`, `## Downloads` (one line per zip with its targetAbi) — copy
+   the previous release's notes and edit.
+5. **Manifests**: in the plugin-repo, set `version`, `changelog`, `sourceUrl`,
+   `checksum` and `timestamp` of each manifest's entry from the build output
+   (`manifest.json` ← jf12 zip, `manifest-10.json` ← jf10 zip). During
+   stabilization replace the single entry; afterwards prepend a new one.
+   Commit `chore: bump gapless player to <version>` and push. Check that the
+   public raw manifest serves the new version and its `sourceUrl`s return 200.
+6. **Stabilization only**: after the manifests are live (never before — the
+   catalog must not point at a missing zip), delete the previous release and
+   tag: `gh release delete v<old> --yes --cleanup-tag`, then
+   `git push origin :refs/tags/v<old>` and `git tag -d v<old>`.
+
+Gotcha: bin/obj/artifacts created by older root container runs are root-owned
+and not writable; `build.sh` avoids bin/obj by building from `git archive`, and
+refuses an unwritable output dir (remove it, or pass `OUT=<dir>`).
+
 ## Release policy
 
 Two phases:

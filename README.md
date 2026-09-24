@@ -97,7 +97,8 @@ dotnet publish Jellyfin.Plugin.GaplessPlayer/Jellyfin.Plugin.GaplessPlayer.cspro
   -c Release -p:JellyfinTfm=net9.0 -p:JellyfinAbiVersion=10.11.11
 ```
 
-`scripts/build.sh` runs the full matrix and produces packaged zips plus their
+`CHANGELOG="..." scripts/build.sh` runs the full matrix in .NET SDK containers
+(Docker required, no local SDK needed) and produces packaged zips plus their
 manifest checksums in `artifacts/`.
 
 | Jellyfin | .NET SDK | targetAbi     |
