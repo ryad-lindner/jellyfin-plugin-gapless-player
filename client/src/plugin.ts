@@ -1,4 +1,6 @@
 import type { AppHostApi, AppSettingsApi, EventsApi, PlaybackManagerApi, PluginDeps } from './deps';
+import { initNotifications } from './notifications';
+import { getServerConfig } from './serverConfig';
 import { setToggleDeps } from './toggle';
 
 const TICKS_PER_MS = 10000;
@@ -204,6 +206,7 @@ class WebAudioGaplessPlayer {
         this._volume = this.getSavedVolumeLevel();
         // Let the now-playing-bar toggle restart the queue on the other player.
         setToggleDeps(deps);
+        initNotifications(deps);
     }
 
     // --- Local settings (localStorage via appSettings) ---------------------
@@ -214,8 +217,10 @@ class WebAudioGaplessPlayer {
         return value == null ? true : value === 'true';
     }
 
+    /** A local setting wins; otherwise the server-wide default applies. */
     private isDebugEnabled(): boolean {
-        return this._appSettings.get(SETTING_DEBUG) === 'true';
+        const value = this._appSettings.get(SETTING_DEBUG);
+        return value == null ? getServerConfig().debugLogging : value === 'true';
     }
 
     private getSavedVolumeLevel(): number {

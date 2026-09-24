@@ -21,4 +21,17 @@ public class PluginConfiguration : BasePluginConfiguration
     /// this locally.
     /// </summary>
     public bool DebugLogging { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the web client shows a browser
+    /// notification when an audio track starts. Each browser still asks the
+    /// user for notification permission before the first one is shown.
+    /// </summary>
+    public bool NotificationsEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether notifications are suppressed
+    /// while the Jellyfin tab is visible and focused.
+    /// </summary>
+    public bool NotificationsBackgroundOnly { get; set; } = true;
 }

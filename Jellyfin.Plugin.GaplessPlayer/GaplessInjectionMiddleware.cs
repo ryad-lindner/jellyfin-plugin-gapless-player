@@ -19,8 +19,6 @@ public class GaplessInjectionMiddleware
 {
     private const string WindowKey = "GaplessPlayer";
     private const string ScriptMarker = "id=\"gapless-player-plugin\"";
-    private const string ScriptTag =
-        "<script " + ScriptMarker + " src=\"GaplessPlayer/gaplessPlayer.js\"></script>";
     private const string ClientResource = "Jellyfin.Plugin.GaplessPlayer.Web.gaplessPlayer.js";
     private const string ClientPathSuffix = "/GaplessPlayer/gaplessPlayer.js";
 
@@ -153,8 +151,25 @@ public class GaplessInjectionMiddleware
         }
 
         _logger.LogDebug("Gapless Player: injected script tag into index.html response");
-        return html.Insert(idx, ScriptTag);
+        return html.Insert(idx, BuildScriptTag());
     }
+
+    /// <summary>
+    /// Builds the script tag, carrying the server-wide settings the client
+    /// needs as data attributes: non-admin users cannot read the plugin
+    /// configuration endpoint, and index.html is rewritten per request anyway.
+    /// </summary>
+    private static string BuildScriptTag()
+    {
+        var config = Plugin.Instance?.Configuration;
+        return "<script " + ScriptMarker
+            + " data-debug-logging=\"" + Flag(config?.DebugLogging) + "\""
+            + " data-notifications=\"" + Flag(config?.NotificationsEnabled) + "\""
+            + " data-notifications-background-only=\"" + Flag(config?.NotificationsBackgroundOnly ?? true) + "\""
+            + " src=\"GaplessPlayer/gaplessPlayer.js\"></script>";
+    }
+
+    private static string Flag(bool? value) => value == true ? "true" : "false";
 
     private string InjectConfig(string json)
     {

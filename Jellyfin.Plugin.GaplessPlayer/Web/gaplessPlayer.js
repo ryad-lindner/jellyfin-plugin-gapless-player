@@ -1,9 +1,136 @@
 "use strict";
 (() => {
+  // src/serverConfig.ts
+  var SCRIPT_ID = "gapless-player-plugin";
+  function getServerConfig() {
+    const data = document.getElementById(SCRIPT_ID)?.dataset ?? {};
+    return {
+      debugLogging: data.debugLogging === "true",
+      notifications: data.notifications === "true",
+      // Default on: a notification for the tab you are looking at is noise.
+      notificationsBackgroundOnly: data.notificationsBackgroundOnly !== "false"
+    };
+  }
+
+  // src/notifications.ts
+  var LOG_PREFIX = "[GaplessPlayer]";
+  var NOTIFICATION_TAG = "gapless-player-now-playing";
+  var ICON_MAX_HEIGHT = 256;
+  var DUPLICATE_WINDOW_MS = 5e3;
+  var initialized = false;
+  var permissionRequest = null;
+  var lastNotified = null;
+  function isSupported() {
+    return typeof window.Notification !== "undefined";
+  }
+  function artistLine(item) {
+    const names = item.ArtistItems?.map((a) => a.Name).filter((n) => !!n);
+    if (names?.length) {
+      return names.join(", ");
+    }
+    if (item.Artists?.length) {
+      return item.Artists.join(", ");
+    }
+    return item.AlbumArtist || "";
+  }
+  function imageUrl(deps2, item) {
+    let id;
+    let tag;
+    if (item.AlbumId && item.AlbumPrimaryImageTag) {
+      id = item.AlbumId;
+      tag = item.AlbumPrimaryImageTag;
+    } else if (item.Id && item.ImageTags?.Primary) {
+      id = item.Id;
+      tag = item.ImageTags.Primary;
+    }
+    if (!id || !tag) {
+      return void 0;
+    }
+    try {
+      const apiClient = deps2.ServerConnections?.getApiClient?.(item);
+      return apiClient?.getScaledImageUrl?.(id, { type: "Primary", tag, maxHeight: ICON_MAX_HEIGHT });
+    } catch {
+      return void 0;
+    }
+  }
+  async function show(deps2, item) {
+    const title = item.Name || "Now playing";
+    const options = {
+      body: [artistLine(item), item.Album].filter(Boolean).join(" \u2014 "),
+      icon: imageUrl(deps2, item),
+      tag: NOTIFICATION_TAG,
+      renotify: true,
+      // The music is the sound; a notification chime over it is not wanted.
+      silent: true
+    };
+    try {
+      const notification = new Notification(title, options);
+      notification.onclick = () => {
+        window.focus();
+        notification.close();
+      };
+      return;
+    } catch {
+    }
+    try {
+      const registration = await navigator.serviceWorker?.getRegistration();
+      await registration?.showNotification(title, options);
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} could not show now-playing notification`, err);
+    }
+  }
+  function requestPermission() {
+    if (!permissionRequest) {
+      permissionRequest = Promise.resolve(Notification.requestPermission()).then(() => Notification.permission).catch(() => Notification.permission).finally(() => {
+        permissionRequest = null;
+      });
+    }
+    return permissionRequest;
+  }
+  function onPlaybackStart(deps2, state) {
+    const config = getServerConfig();
+    if (!config.notifications || !isSupported()) {
+      return;
+    }
+    const item = state?.NowPlayingItem;
+    if (!item || item.MediaType !== "Audio") {
+      return;
+    }
+    const now = Date.now();
+    if (item.Id && lastNotified?.id === item.Id && now - lastNotified.at < DUPLICATE_WINDOW_MS) {
+      return;
+    }
+    const notify = () => {
+      if (config.notificationsBackgroundOnly && !document.hidden && document.hasFocus()) {
+        return;
+      }
+      lastNotified = item.Id ? { id: item.Id, at: now } : null;
+      void show(deps2, item);
+    };
+    if (Notification.permission === "granted") {
+      notify();
+    } else if (Notification.permission === "default") {
+      void requestPermission().then((permission) => {
+        if (permission === "granted") {
+          notify();
+        }
+      });
+    }
+  }
+  function initNotifications(deps2) {
+    if (initialized) {
+      return;
+    }
+    initialized = true;
+    deps2.events.on(deps2.playbackManager, "playbackstart", (...args) => {
+      onPlaybackStart(deps2, args[2]);
+    });
+  }
+
   // src/toggle.ts
   var SETTING_ENABLED = "enableWebAudioGapless";
   var BUTTON_CLASS = "gaplessToggleButton";
-  var LOG_PREFIX = "[GaplessPlayer]";
+  var LOG_PREFIX2 = "[GaplessPlayer]";
   var deps = null;
   function setToggleDeps(value) {
     deps = value;
@@ -79,7 +206,7 @@
       });
       return true;
     } catch (err) {
-      console.warn(`${LOG_PREFIX} live toggle restart failed; applies on next playback`, err);
+      console.warn(`${LOG_PREFIX2} live toggle restart failed; applies on next playback`, err);
       return false;
     }
   }
@@ -129,7 +256,7 @@
   var TIMEUPDATE_INTERVAL_MS = 1e3;
   var DOWNLOAD_PROGRESS_EVENT_MS = 500;
   var BLOCKING_LOOKAHEAD_THRESHOLD_MS = 3e4;
-  var LOG_PREFIX2 = "[GaplessPlayer]";
+  var LOG_PREFIX3 = "[GaplessPlayer]";
   var SETTING_ENABLED2 = "enableWebAudioGapless";
   var SETTING_DEBUG = "enableWebAudioGaplessDebug";
   var SETTING_VOLUME = "volume";
@@ -234,6 +361,7 @@
       this._appHost = deps2.appHost;
       this._volume = this.getSavedVolumeLevel();
       setToggleDeps(deps2);
+      initNotifications(deps2);
     }
     // --- Local settings (localStorage via appSettings) ---------------------
     /** Installed = enabled: default true when the setting has never been set. */
@@ -241,8 +369,10 @@
       const value = this._appSettings.get(SETTING_ENABLED2);
       return value == null ? true : value === "true";
     }
+    /** A local setting wins; otherwise the server-wide default applies. */
     isDebugEnabled() {
-      return this._appSettings.get(SETTING_DEBUG) === "true";
+      const value = this._appSettings.get(SETTING_DEBUG);
+      return value == null ? getServerConfig().debugLogging : value === "true";
     }
     getSavedVolumeLevel() {
       const saved = Number.parseFloat(String(this._appSettings.get(SETTING_VOLUME) ?? 1));
@@ -258,9 +388,9 @@
         return;
       }
       if (data === void 0) {
-        console.debug(`${LOG_PREFIX2} ${message}`);
+        console.debug(`${LOG_PREFIX3} ${message}`);
       } else {
-        console.debug(`${LOG_PREFIX2} ${message}`, data);
+        console.debug(`${LOG_PREFIX3} ${message}`, data);
       }
     }
     // --- Player contract ---------------------------------------------------
@@ -325,7 +455,7 @@
         if (isAbortError(err)) {
           return;
         }
-        console.warn(`${LOG_PREFIX2} initial decode failed; handing off to normal playback`, err);
+        console.warn(`${LOG_PREFIX3} initial decode failed; handing off to normal playback`, err);
         this._handoffToNormalPlayback(this._currentIndex, Math.round(this._basePositionMs * TICKS_PER_MS));
         return;
       }
@@ -358,7 +488,7 @@
       this._clearPlaylistState();
       if (this._audioContext) {
         this._audioContext.close().catch((err) => {
-          console.warn(`${LOG_PREFIX2} failed to close AudioContext`, err);
+          console.warn(`${LOG_PREFIX3} failed to close AudioContext`, err);
         });
         this._audioContext = null;
       }
@@ -389,7 +519,7 @@
     currentTime(val) {
       if (val != null) {
         this._seekToMs(val).catch((err) => {
-          console.error(`${LOG_PREFIX2} failed to seek`, err);
+          console.error(`${LOG_PREFIX3} failed to seek`, err);
         });
       }
       return this.getCurrentTimeMs();
@@ -675,7 +805,7 @@
           if (isAbortError(err) || playbackId !== this._playbackId) {
             return;
           }
-          console.error(`${LOG_PREFIX2} failed to restart load after playlist mutation`, err);
+          console.error(`${LOG_PREFIX3} failed to restart load after playlist mutation`, err);
           this._handoffToNormalPlayback(newCurrentIndex);
         });
         return;
@@ -821,7 +951,7 @@
       }
       this._decodeIndex(nextIndex).catch((err) => {
         if (!isAbortError(err)) {
-          console.warn(`${LOG_PREFIX2} failed to preload next item`, err);
+          console.warn(`${LOG_PREFIX3} failed to preload next item`, err);
         }
       });
     }
@@ -909,7 +1039,7 @@
         await this._decodeIndex(nextIndex);
       } catch (err) {
         if (!isAbortError(err)) {
-          console.warn(`${LOG_PREFIX2} failed to decode next item before boundary`, err);
+          console.warn(`${LOG_PREFIX3} failed to decode next item before boundary`, err);
         }
       }
     }
@@ -973,7 +1103,7 @@
         return;
       }
       if (!isNextScheduled && !isNextDecoded) {
-        console.warn(`${LOG_PREFIX2} boundary missed; recovering in place`, {
+        console.warn(`${LOG_PREFIX3} boundary missed; recovering in place`, {
           index,
           nextIndex,
           currentTime: audioContext.currentTime,
@@ -1026,7 +1156,7 @@
         if (isAbortError(err) || playbackId !== this._playbackId) {
           return;
         }
-        console.error(`${LOG_PREFIX2} failed to recover gapless playback`, err);
+        console.error(`${LOG_PREFIX3} failed to recover gapless playback`, err);
         this._handoffToNormalPlayback(index);
       });
     }
@@ -1043,7 +1173,7 @@
         startPositionTicks,
         enableWebAudioGapless: false
       }).catch((err) => {
-        console.error(`${LOG_PREFIX2} failed to hand off to normal playback`, err);
+        console.error(`${LOG_PREFIX3} failed to hand off to normal playback`, err);
       });
     }
     _scheduleLookaheadForCurrent() {

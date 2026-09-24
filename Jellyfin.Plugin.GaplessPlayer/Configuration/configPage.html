@@ -37,6 +37,24 @@
                     </label>
                 </div>
 
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="NotificationsEnabled" />
+                        <span>Show a browser notification when a song starts</span>
+                    </label>
+                    <div class="fieldDescription checkboxFieldDescription">
+                        Applies to all audio playback in the web client. Each browser asks for
+                        notification permission when playback starts. Reload the web client to apply.
+                    </div>
+                </div>
+
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="NotificationsBackgroundOnly" />
+                        <span>Only notify while the Jellyfin tab is in the background</span>
+                    </label>
+                </div>
+
                 <div>
                     <button is="emby-button" type="submit" class="raised button-submit block">
                         <span>Save</span>
@@ -56,6 +74,8 @@
                     ApiClient.getPluginConfiguration(pluginId).then(function (config) {
                         document.querySelector('#Enabled').checked = config.Enabled;
                         document.querySelector('#DebugLogging').checked = config.DebugLogging;
+                        document.querySelector('#NotificationsEnabled').checked = config.NotificationsEnabled;
+                        document.querySelector('#NotificationsBackgroundOnly').checked = config.NotificationsBackgroundOnly;
                         Dashboard.hideLoadingMsg();
                     });
                 });
@@ -67,6 +87,8 @@
                     ApiClient.getPluginConfiguration(pluginId).then(function (config) {
                         config.Enabled = document.querySelector('#Enabled').checked;
                         config.DebugLogging = document.querySelector('#DebugLogging').checked;
+                        config.NotificationsEnabled = document.querySelector('#NotificationsEnabled').checked;
+                        config.NotificationsBackgroundOnly = document.querySelector('#NotificationsBackgroundOnly').checked;
                         ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
                             Dashboard.processPluginConfigurationUpdateResult(result);
                         });
