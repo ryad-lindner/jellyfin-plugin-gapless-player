@@ -172,6 +172,9 @@ class WebAudioGaplessPlayer {
     // bar appears and paints download progress) but audio has not started yet.
     // Non-null only during the initial load window of play().
     private _loadingItem: GaplessItem | null = null;
+    // A seek landed during the load window; the deferred start then skips the
+    // blocking next-track wait, like a seek while playing.
+    private _seekedWhileLoading = false;
     // Key of the item the last itemstarted was fired for; lets _startFrom
     // detect that the item under _currentIndex changed (e.g. remove-current)
     // even when the index did not.
@@ -328,6 +331,7 @@ class WebAudioGaplessPlayer {
         // and pause during the load window is ignored (as before).
         this._started = true;
         this._loadingItem = this.currentItem();
+        this._seekedWhileLoading = false;
         this._startedItemKey = itemKey(this._loadingItem);
         this._events.trigger(this, 'itemstarted', [this.currentItem(), this.currentMediaSource()]);
 
@@ -348,7 +352,7 @@ class WebAudioGaplessPlayer {
             return;
         }
         this._preloadNext();
-        await this._startFrom(this._currentIndex, this._basePositionMs);
+        await this._startFrom(this._currentIndex, this._basePositionMs, { waitForNext: !this._seekedWhileLoading });
     }
 
     stop(destroyPlayer: boolean): Promise<void> {
@@ -410,7 +414,7 @@ class WebAudioGaplessPlayer {
             return Promise.resolve();
         }
 
-        return this._startFrom(this._currentIndex, this._pausePositionMs);
+        return this._startFrom(this._currentIndex, this._pausePositionMs, { waitForNext: false });
     }
 
     paused(): boolean {
@@ -478,13 +482,16 @@ class WebAudioGaplessPlayer {
     private _seekToMs(positionMs: number): Promise<void> {
         if (this._isPaused) {
             // Seeking must not unpause; just move the resume position.
+            if (this._loadingItem) {
+                this._seekedWhileLoading = true;
+            }
             this._basePositionMs = positionMs;
             this._pausePositionMs = positionMs;
             this._events.trigger(this, 'timeupdate');
             return Promise.resolve();
         }
 
-        return this._startFrom(this._currentIndex, positionMs);
+        return this._startFrom(this._currentIndex, positionMs, { waitForNext: false });
     }
 
     setVolume(val: number): void {
@@ -790,7 +797,6 @@ class WebAudioGaplessPlayer {
             // and would leave the start unresolved. Restart the load for the
             // re-keyed current index in its place.
             const playbackId = this._playbackId;
-            const resumeMs = this._pausePositionMs;
             this._decodeIndex(newCurrentIndex)
                 .then(() => {
                     // Re-check the load window besides the playbackId: play()'s
@@ -801,7 +807,8 @@ class WebAudioGaplessPlayer {
                     if (playbackId !== this._playbackId || !this._loadingItem) {
                         return Promise.resolve();
                     }
-                    return this._startFrom(newCurrentIndex, resumeMs);
+                    // Read the position now: a seek may have moved it meanwhile.
+                    return this._startFrom(newCurrentIndex, this._pausePositionMs, { waitForNext: !this._seekedWhileLoading });
                 })
                 .catch((err) => {
                     if (isAbortError(err) || playbackId !== this._playbackId) {
@@ -999,7 +1006,17 @@ class WebAudioGaplessPlayer {
         });
     }
 
-    private async _startFrom(index: number, positionMs: number): Promise<void> {
+    /**
+     * Starts `index` at `positionMs`. With `waitForNext`, a start within the
+     * last BLOCKING_LOOKAHEAD_THRESHOLD_MS first waits for the next item's
+     * decode so a short remainder still transitions gaplessly. Seek and
+     * unpause (including a seek during the load window) pass false:
+     * the user expects audio right away, and blocking on a full next-track
+     * download is silence (repeated on every click). The lookahead then
+     * schedules from the decode callback (_scheduleDecodedLookahead), or
+     * the boundary recovers in place.
+     */
+    private async _startFrom(index: number, positionMs: number, { waitForNext = true } = {}): Promise<void> {
         await this._ensureAudioGraph();
         const audioContext = this._audioContext;
         if (!audioContext) {
@@ -1028,7 +1045,7 @@ class WebAudioGaplessPlayer {
             return;
         }
         const remainingMs = Math.max(0, (currentBuffer.duration * 1000) - positionMs);
-        if (remainingMs <= BLOCKING_LOOKAHEAD_THRESHOLD_MS) {
+        if (waitForNext && remainingMs <= BLOCKING_LOOKAHEAD_THRESHOLD_MS) {
             await this._decodeNextForBoundary(index);
         }
 

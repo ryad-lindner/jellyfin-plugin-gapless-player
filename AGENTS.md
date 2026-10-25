@@ -42,8 +42,9 @@ bundle from the embedded resource at `/.../GaplessPlayer/gaplessPlayer.js`.
 History: the first attempt disk-patched the web root on startup. That fails on
 the official container image — the web dir is read-only to the runtime user
 (`UnauthorizedAccessException` creating `<webroot>/GaplessPlayer`). The middleware
-approach needs no write access and is what File Transformation does generically;
-FT itself has no Jellyfin 12 build yet, so we do the specific rewrite ourselves.
+approach needs no write access. File Transformation (3.x) uses the same
+`IStartupFilter` technique generically; we keep our own specific rewrite so the
+plugin has no dependency (FT's exact-ABI manifest also hides it on newer 12.x).
 Enable/disable is live because the middleware checks `Plugin.Instance.Configuration.Enabled`
 per request (a web-client reload applies it; no server restart).
 
@@ -79,13 +80,25 @@ defaults to enabled.
 
 ## Build matrix
 
-Different Jellyfin majors need different .NET SDKs. One source tree, per-target
-MSBuild properties:
+Support policy: only the current official Jellyfin release line (12.x) is
+supported. Jellyfin 10.11 is **frozen** at 0.1.0.5: no new features or fixes,
+and `build.sh` does not build it (its zip stays on the v0.1.0.5 release).
 
-| Jellyfin | .NET SDK | `-p:JellyfinTfm` | `-p:JellyfinAbiVersion` | manifest targetAbi |
-|----------|----------|------------------|-------------------------|--------------------|
-| 12.0.x   | net10.0  | net10.0 (default)| 12.0.0-rc2              | 12.0.0.0           |
-| 10.11.x  | net9.0   | net9.0           | 10.11.11                | 10.11.11.0         |
+Dependencies follow upstream: the Jellyfin package version floats over stable
+12.x (`12.*`, as the official jellyfin-plugin-* repos do). `targetAbi` must
+equal the resolved version: Jellyfin bumps its assembly versions every minor
+(12.3.0 ships `MediaBrowser.Controller` 12.3.0.0), and .NET refuses to bind a
+reference to a newer version than the server has loaded, so a 12.3 build fails
+to load on 12.2. `build.sh` therefore derives `targetAbi` from
+`obj/project.assets.json`; keep `build.yaml` in sync (the script warns).
+Deviate from upstream versions only for an unfixed higher-severity CVE.
+
+One source tree, per-target MSBuild properties:
+
+| Jellyfin | .NET SDK | `-p:JellyfinTfm` | `-p:JellyfinAbiVersion` | manifest targetAbi | Status |
+|----------|----------|------------------|-------------------------|--------------------|--------|
+| 12.x     | net10.0  | net10.0 (default)| `12.*` (default)        | resolved, e.g. 12.3.0.0 | supported |
+| 10.11.x  | net9.0   | net9.0           | 10.11.11                | 10.11.11.0         | frozen |
 
 `-p:TargetFramework` does NOT work for overriding (MSBuild strips a global
 `TargetFramework` in the outer build); the intermediate `JellyfinTfm` property
@@ -103,7 +116,7 @@ docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work -w /work \
   mcr.microsoft.com/dotnet/sdk:10.0 sh -lc \
   'dotnet build Jellyfin.Plugin.GaplessPlayer/Jellyfin.Plugin.GaplessPlayer.csproj -c Release'
 
-# C# jf10.11 (clean obj/bin first — TFM differs)
+# C# jf10.11, frozen; only if ever needed (clean obj/bin first — TFM differs)
 docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work -w /work \
   mcr.microsoft.com/dotnet/sdk:9.0 sh -lc \
   'rm -rf Jellyfin.Plugin.GaplessPlayer/obj Jellyfin.Plugin.GaplessPlayer/bin && \
@@ -116,9 +129,9 @@ docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work -w /work \
 Source of truth is a private git host, mirrored to a public GitHub repo that the
 Jellyfin plugin installer can fetch anonymously. One manifest per Jellyfin major
 (`manifest.json` = 12, `manifest-10.json` = 10.11) so a server only sees a
-compatible build. `scripts/build.sh` produces the per-major zips and their md5
-checksums for the manifest. Manifest hosting/URLs are deployment config and are
-kept out of this repo.
+compatible build. `manifest-10.json` is frozen at 0.1.0.5. `scripts/build.sh`
+produces the jf12 zip and its manifest fields. Manifest hosting/URLs are
+deployment config and are kept out of this repo.
 
 ## Release steps
 
@@ -130,28 +143,36 @@ GitHub mirror's releases; the manifests live in a separate plugin-repo repo
 1. **Client bundle.** If `client/src` changed, rebuild and commit
    `Web/gaplessPlayer.js` (see the container commands above).
 2. **Bump the version** (4-part, e.g. `0.1.0.6`) in the csproj
-   `AssemblyVersion`/`FileVersion`, `build.yaml` and `build.10.yaml`. Commit
-   `chore: release <version>`, tag annotated `v<version>` with message
-   `Gapless Player <version>`, push `main` and the tag.
+   `AssemblyVersion`/`FileVersion` and `build.yaml` (`build.10.yaml` is frozen).
+   Commit `chore: release <version>` and tag annotated `v<version>` with message
+   `Gapless Player <version>`. Do not push yet.
 3. **Package**: `CHANGELOG="..." scripts/build.sh`. It builds the committed
-   tree for both majors in SDK containers and prints `sourceUrl`, `checksum`
-   (md5) and `timestamp` per zip. The changelog follows the release policy
-   (whole feature set during stabilization, delta afterwards).
+   tree in an SDK container and prints `targetAbi`, `sourceUrl`, `checksum`
+   (md5) and `timestamp`. If it warns that `build.yaml`'s `targetAbi` differs
+   (a new Jellyfin 12.x was released), update `build.yaml` and the minimum
+   server version in README.md, amend the release commit, re-tag
+   (`git tag -f -a ...`) and rebuild. The changelog follows the release policy
+   (whole feature set during stabilization, delta afterwards). Then push
+   `main` and the tag.
 4. **GitHub release** once the tag has mirrored:
    `gh release create v<version> --verify-tag --title "Gapless Player <version>"
-   --notes-file <notes> artifacts/*.zip`. Notes: intro line, `## Features`,
-   `## Install`, `## Downloads` (one line per zip with its targetAbi) — copy
-   the previous release's notes and edit.
-5. **Manifests**: in the plugin-repo, set `version`, `changelog`, `sourceUrl`,
-   `checksum` and `timestamp` of each manifest's entry from the build output
-   (`manifest.json` ← jf12 zip, `manifest-10.json` ← jf10 zip). During
-   stabilization replace the single entry; afterwards prepend a new one.
-   Commit `chore: bump gapless player to <version>` and push. Check that the
-   public raw manifest serves the new version and its `sourceUrl`s return 200.
+   --notes-file <notes> artifacts/gapless-player_<version>-jf12.zip`. Notes:
+   intro line, `## Features`, `## Install`, `## Downloads` (the zip with its
+   targetAbi) — copy the previous release's notes and edit; list only the
+   jf12 zip (drop any jf10 line carried over from v0.1.0.5).
+5. **Manifests**: in the plugin-repo, set `version`, `changelog`, `targetAbi`,
+   `sourceUrl`, `checksum` and `timestamp` of the manifest entry from the
+   build output (`manifest.json` ← jf12 zip; `manifest-10.json` stays
+   frozen). During stabilization replace the single entry; afterwards prepend
+   a new one. Commit `chore: bump gapless player to <version>` and push.
+   Check that the public raw manifest serves the new version and its
+   `sourceUrl`s return 200.
 6. **Stabilization only**: after the manifests are live (never before — the
    catalog must not point at a missing zip), delete the previous release and
    tag: `gh release delete v<old> --yes --cleanup-tag`, then
    `git push origin :refs/tags/v<old>` and `git tag -d v<old>`.
+   **Never delete v0.1.0.5**: the frozen `manifest-10.json` points at its jf10
+   zip.
 
 Gotcha: bin/obj/artifacts created by older root container runs are root-owned
 and not writable; `build.sh` avoids bin/obj by building from `git archive`, and
@@ -163,10 +184,12 @@ Two phases:
 
 **Stabilization (current).** Until there is one accepted, working release, keep
 only the latest: each bump deletes the previous release + tag (GitHub and Gitea)
-and the manifests list a single version. Intermediate builds during this phase
-are bug-fix iterations, not milestones worth preserving. Because there is no
-version history on the release page, the GitHub release notes and the manifest
-`changelog` describe the **whole feature set**, not the delta.
+and `manifest.json` lists a single version. Exception: v0.1.0.5 is never
+deleted, because the frozen `manifest-10.json` points at its jf10 zip.
+Intermediate builds during this phase are bug-fix iterations, not milestones
+worth preserving. Because there is no version history on the release page, the
+GitHub release notes and the manifest `changelog` describe the **whole feature
+set**, not the delta.
 
 **Normal versioning (once a first stable release is accepted).** Stop deleting
 old releases; keep version history in the manifest (append new version entries,
@@ -179,11 +202,23 @@ current release is confirmed working end-to-end.
 
 ## Not done yet / TODO
 
-- In-player quick-toggle button (DOM injection into the now-playing bar). Design
-  it against the running web client's DOM, not from guesswork. Until then the
-  localStorage `enableWebAudioGapless` key is the toggle.
-- CI (build both majors, package, publish release + manifest to the mirror).
+- CI (build, package, publish release + manifest to the mirror).
 - Runtime verification on a real server (see the fork HANDOFF's test matrix:
   album switch mid-play, repeat One/All at boundaries, shuffle mid-play,
   queue-next / remove-current / reorder, throttled-network boundary recovery).
-- Optional File Transformation path once it ships for the Jellyfin 12 ABI.
+  Also the non-blocking starts (no automated client tests exist): on a
+  throttled network, seek into the last 30 s while the next track is still
+  downloading (starts at once, gapless if the decode lands first); seek during
+  the initial load (also back to exactly the start position, and after a
+  remove/reorder during the load); rapid pause/unpause/seek near the end.
+- Pause while a start is in flight (a seek/unpause still decoding, or boundary
+  recovery waiting for the next item) does not stop that start: audio begins
+  behind the pause. Just bumping `_playbackId` in `pause()` is NOT enough; it
+  strands `_loadingItem` (paused() stays false), saves a pause position that
+  counted the wait, and resumes recovery on the old index (duplicate
+  itemstopped). Needs an explicit "start pending" state in `_startFrom`.
+- ReplayGain / audio normalization: the stock player applies the item's
+  normalization gain; ours plays at raw level (volume-only `GainNode`). Parked
+  until it is known to matter.
+- Middleware edge cases: HEAD and `Range` requests on the rewritten
+  `index.html`/`config.json` paths; no cache headers on the served bundle.

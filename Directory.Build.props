@@ -1,9 +1,6 @@
 <Project>
 
   <PropertyGroup>
-    <!-- TargetFramework and the Jellyfin ABI version are set per-build in the
-         .csproj (defaults) and overridable from the command line so one source
-         tree can target multiple Jellyfin majors. -->
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>

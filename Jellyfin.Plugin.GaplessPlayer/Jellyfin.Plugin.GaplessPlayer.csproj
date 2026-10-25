@@ -5,15 +5,17 @@
     <AssemblyVersion>0.1.0.5</AssemblyVersion>
     <FileVersion>0.1.0.5</FileVersion>
 
-    <!-- Per-target defaults (Jellyfin 12 line). Override on the command line
-         for the Jellyfin 10.11 build:
-           -p:JellyfinTfm=net8.0 -p:JellyfinAbiVersion=10.11.11
-         Jellyfin 12 targets net10.0; Jellyfin 10.11 targets net8.0.
+    <!-- Per-target defaults (Jellyfin 12 line, supported). The package version
+         floats over stable 12.x like the official Jellyfin plugins do; the
+         DLL then references the resolved version's assemblies, so
+         scripts/build.sh sets the manifest targetAbi to that version.
+         The frozen Jellyfin 10.11 build overrides on the command line:
+           -p:JellyfinTfm=net9.0 -p:JellyfinAbiVersion=10.11.11
          An intermediate property is used because MSBuild special-cases a
          global TargetFramework and strips it from the outer build. -->
     <JellyfinTfm Condition="'$(JellyfinTfm)' == ''">net10.0</JellyfinTfm>
     <TargetFramework>$(JellyfinTfm)</TargetFramework>
-    <JellyfinAbiVersion Condition="'$(JellyfinAbiVersion)' == ''">12.0.0-rc2</JellyfinAbiVersion>
+    <JellyfinAbiVersion Condition="'$(JellyfinAbiVersion)' == ''">12.*</JellyfinAbiVersion>
   </PropertyGroup>
 
   <ItemGroup>

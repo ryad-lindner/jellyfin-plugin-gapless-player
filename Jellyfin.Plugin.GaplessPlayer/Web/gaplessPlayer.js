@@ -330,6 +330,9 @@
       // bar appears and paints download progress) but audio has not started yet.
       // Non-null only during the initial load window of play().
       this._loadingItem = null;
+      // A seek landed during the load window; the deferred start then skips the
+      // blocking next-track wait, like a seek while playing.
+      this._seekedWhileLoading = false;
       // Key of the item the last itemstarted was fired for; lets _startFrom
       // detect that the item under _currentIndex changed (e.g. remove-current)
       // even when the index did not.
@@ -446,6 +449,7 @@
       }
       this._started = true;
       this._loadingItem = this.currentItem();
+      this._seekedWhileLoading = false;
       this._startedItemKey = itemKey(this._loadingItem);
       this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
       await this._ensureAudioGraph();
@@ -460,7 +464,7 @@
         return;
       }
       this._preloadNext();
-      await this._startFrom(this._currentIndex, this._basePositionMs);
+      await this._startFrom(this._currentIndex, this._basePositionMs, { waitForNext: !this._seekedWhileLoading });
     }
     stop(destroyPlayer) {
       this._abandonOptimisticStart();
@@ -511,7 +515,7 @@
       if (!this._isPaused) {
         return Promise.resolve();
       }
-      return this._startFrom(this._currentIndex, this._pausePositionMs);
+      return this._startFrom(this._currentIndex, this._pausePositionMs, { waitForNext: false });
     }
     paused() {
       return this._loadingItem ? false : this._isPaused;
@@ -557,12 +561,15 @@
     }
     _seekToMs(positionMs) {
       if (this._isPaused) {
+        if (this._loadingItem) {
+          this._seekedWhileLoading = true;
+        }
         this._basePositionMs = positionMs;
         this._pausePositionMs = positionMs;
         this._events.trigger(this, "timeupdate");
         return Promise.resolve();
       }
-      return this._startFrom(this._currentIndex, positionMs);
+      return this._startFrom(this._currentIndex, positionMs, { waitForNext: false });
     }
     setVolume(val) {
       this._volume = Math.max(0, Math.min(val, 100));
@@ -795,12 +802,11 @@
       }
       if (this._loadingItem) {
         const playbackId = this._playbackId;
-        const resumeMs = this._pausePositionMs;
         this._decodeIndex(newCurrentIndex).then(() => {
           if (playbackId !== this._playbackId || !this._loadingItem) {
             return Promise.resolve();
           }
-          return this._startFrom(newCurrentIndex, resumeMs);
+          return this._startFrom(newCurrentIndex, this._pausePositionMs, { waitForNext: !this._seekedWhileLoading });
         }).catch((err) => {
           if (isAbortError(err) || playbackId !== this._playbackId) {
             return;
@@ -955,7 +961,17 @@
         }
       });
     }
-    async _startFrom(index, positionMs) {
+    /**
+     * Starts `index` at `positionMs`. With `waitForNext`, a start within the
+     * last BLOCKING_LOOKAHEAD_THRESHOLD_MS first waits for the next item's
+     * decode so a short remainder still transitions gaplessly. Seek and
+     * unpause (including a seek during the load window) pass false:
+     * the user expects audio right away, and blocking on a full next-track
+     * download is silence (repeated on every click). The lookahead then
+     * schedules from the decode callback (_scheduleDecodedLookahead), or
+     * the boundary recovers in place.
+     */
+    async _startFrom(index, positionMs, { waitForNext = true } = {}) {
       await this._ensureAudioGraph();
       const audioContext = this._audioContext;
       if (!audioContext) {
@@ -981,7 +997,7 @@
         return;
       }
       const remainingMs = Math.max(0, currentBuffer.duration * 1e3 - positionMs);
-      if (remainingMs <= BLOCKING_LOOKAHEAD_THRESHOLD_MS) {
+      if (waitForNext && remainingMs <= BLOCKING_LOOKAHEAD_THRESHOLD_MS) {
         await this._decodeNextForBoundary(index);
       }
       if (playbackId !== this._playbackId) {
