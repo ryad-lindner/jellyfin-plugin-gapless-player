@@ -86,7 +86,8 @@ defaults to enabled.
 on `node:test`. `test/fakes.ts` provides a Web Audio context with a manual
 clock (`advance()` fires `onended` in end order, one render quantum late),
 `holdFetch()`/`holdDecode()` to delay a track's download or (non-abortable)
-decode, tracks that fail to decode, and an events/playbackManager pair that
+decode, `suspendUntilReleased()` to hold `resume()` like a suspended
+AudioContext, tracks that fail to decode, and an events/playbackManager pair that
 mirrors stock jellyfin-web (it destroys the player when it cannot play the
 announced next item). Tests assert the itemstarted/itemstopped log, positions,
 audible sources and handoffs. Add a test for every pairing or start/pause fix.
@@ -220,7 +221,7 @@ current release is confirmed working end-to-end.
   album switch mid-play, repeat One/All at boundaries, shuffle mid-play,
   queue-next / remove-current / reorder, throttled-network boundary recovery).
   Also, in a real browser (the client tests cover the logic, not real decoders,
-  networks or AudioContext suspension), the non-blocking starts: on a
+  networks or a real AudioContext suspension), the non-blocking starts: on a
   throttled network, seek into the last 30 s while the next track is still
   downloading (starts at once, gapless if the decode lands first); seek during
   the initial load (also back to exactly the start position, and after a
@@ -230,13 +231,12 @@ current release is confirmed working end-to-end.
   tracks (must hand off once to the normal player, with one itemstopped for
   the item that was announced): as the first track, after a pause during its
   load then unpause, and via next/select; remove-current during the load.
-- Starts that wait for a suspended AudioContext to resume (mobile background
-  interruptions) are not fully pause-safe: a pause during a seek's wait saves
-  the pre-seek position; a pause or seek during an unpause's wait is ignored;
-  a next/select whose target is removed during the wait leaves the current
-  track's `_schedule` entry bound to a retired `_playbackId`, so its successor
-  is never scheduled. Needs an
-  explicit pending-start state that `pause()` and mutations can see.
+  On a phone: pause, seek and next while the AudioContext is suspended by a
+  background interruption (iOS reports `'interrupted'`, treated like
+  `'suspended'` by inference, not verified on a device).
+- An unpause pressed while a skip waits for a suspended AudioContext is folded
+  into that skip; if the skip's target is then removed before the context
+  resumes, the player stays paused on the current item.
 - ReplayGain / audio normalization: the stock player applies the item's
   normalization gain; ours plays at raw level (volume-only `GainNode`). Parked
   until it is known to matter.

@@ -60,6 +60,13 @@ interface OwedStop {
     started: boolean;
 }
 
+interface PendingStart {
+    playbackId: number;
+    targetKey: string | null;
+    positionMs: number;
+    waitForNext: boolean;
+}
+
 interface ScheduleEntry {
     startTime: number;
     playbackId: number;
@@ -194,6 +201,10 @@ class WebAudioGaplessPlayer {
     private _seekedWhileLoading = false;
     // waitForNext of the latest _startFrom, for restarting it after a mutation.
     private _startWaitsForNext = true;
+    // A start waiting for a suspended AudioContext to resume; it has not
+    // touched the playback state yet, so pause, seek, next and previous act on
+    // its target. With a running context this window is one microtask.
+    private _pendingStart: PendingStart | null = null;
     private _lastProgressTriggerMs = 0;
     private _scheduled = new Map<number, AudioBufferSourceNode>();
     private _scheduledStartTimes = new Map<number, number>();
@@ -429,7 +440,8 @@ class WebAudioGaplessPlayer {
     }
 
     pause(): void {
-        if (this._isPaused && !this._loadingItem) {
+        const pending = this._pendingTarget();
+        if (this._isPaused && !this._loadingItem && !pending) {
             return;
         }
 
@@ -437,7 +449,16 @@ class WebAudioGaplessPlayer {
         // seek, next or boundary recovery): the bump keeps it from starting
         // audio behind the pause. Ending the load window makes paused() true;
         // play() then stays paused, and unpause() restarts the start.
-        this._pausePositionMs = this.getCurrentTimeMs();
+        if (pending) {
+            // Pause on the waiting start's target as if it had started; the
+            // item it replaces stops where it was audible.
+            if (this._reportedItem && this._interruptedAtMs == null) {
+                this._interruptedAtMs = this.getCurrentTimeMs();
+            }
+            this._currentIndex = pending.index;
+            this._basePositionMs = pending.positionMs;
+        }
+        this._pausePositionMs = pending ? pending.positionMs : this.getCurrentTimeMs();
         if (this._reportedItem && itemKey(this._reportedItem) === itemKey(this.currentItem())) {
             // A retired seek on the same item: its stop position is the pause
             // position. A retired next keeps the old item's.
@@ -457,7 +478,9 @@ class WebAudioGaplessPlayer {
     }
 
     unpause(): Promise<void> {
-        if (!this._isPaused || !this._playlist.length) {
+        // A start waiting for the AudioContext unpauses by itself; restarting
+        // here would drop its target (e.g. a next pressed while paused).
+        if (!this._isPaused || !this._playlist.length || this._pendingTarget()) {
             return Promise.resolve();
         }
 
@@ -534,18 +557,29 @@ class WebAudioGaplessPlayer {
     }
 
     private _seekToMs(positionMs: number): Promise<void> {
+        const pending = this._pendingTarget();
         if (this._isPaused) {
-            // Seeking must not unpause; just move the resume position.
+            // Seeking must not unpause; just move the resume position. A start
+            // waiting for the AudioContext is restarted below, and anything
+            // that restarts it before then must find the new position too.
             if (this._loadingItem) {
                 this._seekedWhileLoading = true;
             }
+            if (pending && this._reportedItem && this._interruptedAtMs == null
+                && itemKey(this._reportedItem) !== itemKey(this._playlist[pending.index])) {
+                // The paused position is the replaced item's stop position
+                // until the waiting start runs; keep it before moving it.
+                this._interruptedAtMs = this.getCurrentTimeMs();
+            }
             this._basePositionMs = positionMs;
             this._pausePositionMs = positionMs;
-            this._events.trigger(this, 'timeupdate');
-            return Promise.resolve();
+            if (!pending) {
+                this._events.trigger(this, 'timeupdate');
+                return Promise.resolve();
+            }
         }
 
-        return this._startFrom(this._currentIndex, positionMs, { waitForNext: false });
+        return this._startFrom(pending ? pending.index : this._currentIndex, positionMs, { waitForNext: false });
     }
 
     setVolume(val: number): void {
@@ -716,7 +750,9 @@ class WebAudioGaplessPlayer {
     nextTrack(): Promise<void> {
         // Mirrors PlayQueueManager.getNextItemInfo: manual "next" honors
         // RepeatOne (replays current) and RepeatAll (wraps to the start).
-        const nextIndex = this._nextIndex(this._currentIndex);
+        // Count from a start still waiting for the AudioContext, not from the
+        // item it is about to replace.
+        const nextIndex = this._nextIndex(this._pendingTarget()?.index ?? this._currentIndex);
         if (nextIndex == null) {
             return Promise.resolve();
         }
@@ -725,11 +761,13 @@ class WebAudioGaplessPlayer {
     }
 
     previousTrack(): Promise<void> {
-        if (this.getCurrentTimeMs() > 3000) {
-            return this._startFrom(this._currentIndex, 0);
+        const pending = this._pendingTarget();
+        const index = pending?.index ?? this._currentIndex;
+        if ((pending?.positionMs ?? this.getCurrentTimeMs()) > 3000) {
+            return this._startFrom(index, 0);
         }
 
-        return this._startFrom(Math.max(0, this._currentIndex - 1), 0);
+        return this._startFrom(Math.max(0, index - 1), 0);
     }
 
     queue(items: GaplessItem[]): void {
@@ -770,14 +808,25 @@ class WebAudioGaplessPlayer {
             Math.max(0, this._playlist.length - 1)
         );
         this._events.trigger(this, 'playlistitemremove', [{ playlistItemIds }]);
+        const pending = this._pendingStart;
+        if (pending && pending.playbackId === this._playbackId && !this._pendingTarget()) {
+            // Its target is gone: act now, not when the AudioContext resumes,
+            // so an unpause before then starts from the right position.
+            this._pendingStart = null;
+            this._restoreInterruptedPosition();
+        }
 
         if (!this._playlist.length) {
             return this.stop(true);
         }
 
         if (isCurrentRemoved) {
-            // The playing track was removed; start the one that took its place.
+            // The playing track was removed; start the one that took its place,
+            // unless a skip waiting for the AudioContext already chose one.
             this._clearDecodedAfterMutation();
+            if (this._restartPendingStart()) {
+                return Promise.resolve();
+            }
             return this._startFrom(this._currentIndex, 0);
         }
 
@@ -857,6 +906,11 @@ class WebAudioGaplessPlayer {
             // re-keyed current index in its place. The bump retires play()'s
             // _startFrom if it is already waiting on the boundary decode: that
             // abort is swallowed, and it would schedule under the stale index.
+            // A start waiting for the AudioContext already superseded play();
+            // restart that one instead.
+            if (this._restartPendingStart()) {
+                return;
+            }
             const playbackId = ++this._playbackId;
             this._decodeIndex(newCurrentIndex)
                 .then(() => {
@@ -882,6 +936,9 @@ class WebAudioGaplessPlayer {
             // restart it for the re-keyed index or playback stays silent. The
             // bump retires the superseded start, which a swallowed boundary
             // decode abort would otherwise let schedule under the stale index.
+            if (this._restartPendingStart()) {
+                return;
+            }
             this._playbackId++;
             this._recoverAtIndex(newCurrentIndex, this._basePositionMs, { waitForNext: this._startWaitsForNext });
             return;
@@ -905,7 +962,9 @@ class WebAudioGaplessPlayer {
             this._applyVolume();
         }
 
-        if (this._audioContext.state === 'suspended') {
+        // iOS Safari reports 'interrupted' during an audio-session interruption.
+        const state: string = this._audioContext.state;
+        if (state === 'suspended' || state === 'interrupted') {
             await this._audioContext.resume();
         }
     }
@@ -1089,6 +1148,7 @@ class WebAudioGaplessPlayer {
         this._playbackId++;
         const playbackId = this._playbackId;
         const targetKey = itemKey(this._playlist[index]);
+        this._pendingStart = { playbackId, targetKey, positionMs, waitForNext };
         // Callers do not await this start (playbackManager ignores the
         // unpause/seek promise), so a failure to get the audio graph or the
         // decode hands off here instead of rejecting; a superseded one is
@@ -1105,6 +1165,10 @@ class WebAudioGaplessPlayer {
         } catch (err) {
             handOff(err);
             return;
+        } finally {
+            if (this._pendingStart?.playbackId === playbackId) {
+                this._pendingStart = null;
+            }
         }
         if (itemKey(this._playlist[index]) !== targetKey) {
             // A mutation that does not retire starts re-keyed the queue while
@@ -1112,6 +1176,8 @@ class WebAudioGaplessPlayer {
             // A removed target leaves the current track as it was.
             const movedIndex = this._playlist.findIndex(i => itemKey(i) === targetKey);
             if (movedIndex < 0) {
+                // removeFromPlaylist already dropped this start and restored
+                // the position.
                 return;
             }
             index = movedIndex;
@@ -1570,6 +1636,45 @@ class WebAudioGaplessPlayer {
 
         this._loadingItem = null;
         this._emitItemStopped(item, nextItem, this._interruptedAtMs ?? this._pausePositionMs);
+    }
+
+    /** The start still waiting for the AudioContext, if live, and where its target is now. */
+    private _pendingTarget(): { index: number; positionMs: number; waitForNext: boolean } | null {
+        const pending = this._pendingStart;
+        if (!pending || pending.playbackId !== this._playbackId) {
+            return null;
+        }
+        const index = this._playlist.findIndex(i => itemKey(i) === pending.targetKey);
+        return index >= 0 ? { index, positionMs: pending.positionMs, waitForNext: pending.waitForNext } : null;
+    }
+
+    /**
+     * Restarts a start waiting for the AudioContext for its re-keyed target,
+     * superseding the load or start a mutation aborted. _startFrom registers
+     * the new pending start synchronously, so pause, seek and skips keep
+     * acting on it while it waits.
+     */
+    private _restartPendingStart(): boolean {
+        const pending = this._pendingTarget();
+        if (!pending) {
+            return false;
+        }
+        void this._startFrom(pending.index, pending.positionMs, { waitForNext: pending.waitForNext });
+        return true;
+    }
+
+    /**
+     * A paused seek on a waiting start moved the position to its target; once
+     * that target is gone the current item stays where it was. Only while
+     * paused: a playing start of the same item also sets _interruptedAtMs.
+     */
+    private _restoreInterruptedPosition(): void {
+        if (this._isPaused && this._interruptedAtMs != null
+            && itemKey(this._reportedItem) === itemKey(this.currentItem())) {
+            this._basePositionMs = this._interruptedAtMs;
+            this._pausePositionMs = this._interruptedAtMs;
+            this._interruptedAtMs = null;
+        }
     }
 
     private _owedStop(): OwedStop | null {

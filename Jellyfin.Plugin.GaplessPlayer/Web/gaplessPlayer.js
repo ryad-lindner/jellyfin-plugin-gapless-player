@@ -339,6 +339,10 @@
       this._seekedWhileLoading = false;
       // waitForNext of the latest _startFrom, for restarting it after a mutation.
       this._startWaitsForNext = true;
+      // A start waiting for a suspended AudioContext to resume; it has not
+      // touched the playback state yet, so pause, seek, next and previous act on
+      // its target. With a running context this window is one microtask.
+      this._pendingStart = null;
       this._lastProgressTriggerMs = 0;
       this._scheduled = /* @__PURE__ */ new Map();
       this._scheduledStartTimes = /* @__PURE__ */ new Map();
@@ -517,10 +521,18 @@
       this._gainNode = null;
     }
     pause() {
-      if (this._isPaused && !this._loadingItem) {
+      const pending = this._pendingTarget();
+      if (this._isPaused && !this._loadingItem && !pending) {
         return;
       }
-      this._pausePositionMs = this.getCurrentTimeMs();
+      if (pending) {
+        if (this._reportedItem && this._interruptedAtMs == null) {
+          this._interruptedAtMs = this.getCurrentTimeMs();
+        }
+        this._currentIndex = pending.index;
+        this._basePositionMs = pending.positionMs;
+      }
+      this._pausePositionMs = pending ? pending.positionMs : this.getCurrentTimeMs();
       if (this._reportedItem && itemKey(this._reportedItem) === itemKey(this.currentItem())) {
         this._interruptedAtMs = null;
       }
@@ -536,7 +548,7 @@
       return this.unpause();
     }
     unpause() {
-      if (!this._isPaused || !this._playlist.length) {
+      if (!this._isPaused || !this._playlist.length || this._pendingTarget()) {
         return Promise.resolve();
       }
       return this._startFrom(this._currentIndex, this._pausePositionMs, { waitForNext: false });
@@ -587,16 +599,22 @@
       return this._seekToMs(positionTicks / TICKS_PER_MS);
     }
     _seekToMs(positionMs) {
+      const pending = this._pendingTarget();
       if (this._isPaused) {
         if (this._loadingItem) {
           this._seekedWhileLoading = true;
         }
+        if (pending && this._reportedItem && this._interruptedAtMs == null && itemKey(this._reportedItem) !== itemKey(this._playlist[pending.index])) {
+          this._interruptedAtMs = this.getCurrentTimeMs();
+        }
         this._basePositionMs = positionMs;
         this._pausePositionMs = positionMs;
-        this._events.trigger(this, "timeupdate");
-        return Promise.resolve();
+        if (!pending) {
+          this._events.trigger(this, "timeupdate");
+          return Promise.resolve();
+        }
       }
-      return this._startFrom(this._currentIndex, positionMs, { waitForNext: false });
+      return this._startFrom(pending ? pending.index : this._currentIndex, positionMs, { waitForNext: false });
     }
     setVolume(val) {
       this._volume = Math.max(0, Math.min(val, 100));
@@ -723,17 +741,19 @@
       return this._startFrom(index, 0);
     }
     nextTrack() {
-      const nextIndex = this._nextIndex(this._currentIndex);
+      const nextIndex = this._nextIndex(this._pendingTarget()?.index ?? this._currentIndex);
       if (nextIndex == null) {
         return Promise.resolve();
       }
       return this._startFrom(nextIndex, 0);
     }
     previousTrack() {
-      if (this.getCurrentTimeMs() > 3e3) {
-        return this._startFrom(this._currentIndex, 0);
+      const pending = this._pendingTarget();
+      const index = pending?.index ?? this._currentIndex;
+      if ((pending?.positionMs ?? this.getCurrentTimeMs()) > 3e3) {
+        return this._startFrom(index, 0);
       }
-      return this._startFrom(Math.max(0, this._currentIndex - 1), 0);
+      return this._startFrom(Math.max(0, index - 1), 0);
     }
     queue(items) {
       this._playlist.push(...clonePlaylistItems(items, true));
@@ -763,11 +783,19 @@
         Math.max(0, this._playlist.length - 1)
       );
       this._events.trigger(this, "playlistitemremove", [{ playlistItemIds }]);
+      const pending = this._pendingStart;
+      if (pending && pending.playbackId === this._playbackId && !this._pendingTarget()) {
+        this._pendingStart = null;
+        this._restoreInterruptedPosition();
+      }
       if (!this._playlist.length) {
         return this.stop(true);
       }
       if (isCurrentRemoved) {
         this._clearDecodedAfterMutation();
+        if (this._restartPendingStart()) {
+          return Promise.resolve();
+        }
         return this._startFrom(this._currentIndex, 0);
       }
       this._handlePlaylistMutation(oldCurrentIndex);
@@ -831,6 +859,9 @@
         this._decoded.set(newCurrentIndex, currentBuffer);
       }
       if (this._loadingItem) {
+        if (this._restartPendingStart()) {
+          return;
+        }
         const playbackId = ++this._playbackId;
         this._decodeIndex(newCurrentIndex).then(() => {
           if (playbackId !== this._playbackId || !this._loadingItem) {
@@ -847,6 +878,9 @@
         return;
       }
       if (!this._isPaused && !currentSource) {
+        if (this._restartPendingStart()) {
+          return;
+        }
         this._playbackId++;
         this._recoverAtIndex(newCurrentIndex, this._basePositionMs, { waitForNext: this._startWaitsForNext });
         return;
@@ -867,7 +901,8 @@
         this._gainNode.connect(this._audioContext.destination);
         this._applyVolume();
       }
-      if (this._audioContext.state === "suspended") {
+      const state = this._audioContext.state;
+      if (state === "suspended" || state === "interrupted") {
         await this._audioContext.resume();
       }
     }
@@ -1010,6 +1045,7 @@
       this._playbackId++;
       const playbackId = this._playbackId;
       const targetKey = itemKey(this._playlist[index]);
+      this._pendingStart = { playbackId, targetKey, positionMs, waitForNext };
       const handOff = (err) => {
         if (isAbortError(err) || playbackId !== this._playbackId) {
           return;
@@ -1022,6 +1058,10 @@
       } catch (err) {
         handOff(err);
         return;
+      } finally {
+        if (this._pendingStart?.playbackId === playbackId) {
+          this._pendingStart = null;
+        }
       }
       if (itemKey(this._playlist[index]) !== targetKey) {
         const movedIndex = this._playlist.findIndex((i) => itemKey(i) === targetKey);
@@ -1380,6 +1420,41 @@
       }
       this._loadingItem = null;
       this._emitItemStopped(item, nextItem, this._interruptedAtMs ?? this._pausePositionMs);
+    }
+    /** The start still waiting for the AudioContext, if live, and where its target is now. */
+    _pendingTarget() {
+      const pending = this._pendingStart;
+      if (!pending || pending.playbackId !== this._playbackId) {
+        return null;
+      }
+      const index = this._playlist.findIndex((i) => itemKey(i) === pending.targetKey);
+      return index >= 0 ? { index, positionMs: pending.positionMs, waitForNext: pending.waitForNext } : null;
+    }
+    /**
+     * Restarts a start waiting for the AudioContext for its re-keyed target,
+     * superseding the load or start a mutation aborted. _startFrom registers
+     * the new pending start synchronously, so pause, seek and skips keep
+     * acting on it while it waits.
+     */
+    _restartPendingStart() {
+      const pending = this._pendingTarget();
+      if (!pending) {
+        return false;
+      }
+      void this._startFrom(pending.index, pending.positionMs, { waitForNext: pending.waitForNext });
+      return true;
+    }
+    /**
+     * A paused seek on a waiting start moved the position to its target; once
+     * that target is gone the current item stays where it was. Only while
+     * paused: a playing start of the same item also sets _interruptedAtMs.
+     */
+    _restoreInterruptedPosition() {
+      if (this._isPaused && this._interruptedAtMs != null && itemKey(this._reportedItem) === itemKey(this.currentItem())) {
+        this._basePositionMs = this._interruptedAtMs;
+        this._pausePositionMs = this._interruptedAtMs;
+        this._interruptedAtMs = null;
+      }
     }
     _owedStop() {
       if (this._loadingItem) {

@@ -158,8 +158,30 @@ export class FakeAudioContext {
         return { duration: info.durationSec, id };
     }
 
-    resume(): Promise<void> {
-        return Promise.resolve();
+    private resumeGate: Promise<void> | null = null;
+
+    /** Suspends the context; resume() then waits until release() (e.g. a mobile background interruption). */
+    suspendUntilReleased(state: 'suspended' | 'interrupted' = 'suspended'): () => void {
+        this.state = state;
+        let release!: () => void;
+        const resumeGate: Promise<void> = new Promise<void>(resolve => {
+            release = () => {
+                if (this.resumeGate === resumeGate) {
+                    this.resumeGate = null;
+                }
+                resolve();
+            };
+        });
+        this.resumeGate = resumeGate;
+        return release;
+    }
+
+    async resume(): Promise<void> {
+        if (this.state === 'closed') {
+            throw new DOMException('Cannot resume a closed AudioContext', 'InvalidStateError');
+        }
+        await this.resumeGate;
+        this.state = 'running';
     }
 
     close(): Promise<void> {
@@ -181,6 +203,9 @@ export class FakeAudioContext {
 
     /** Moves the clock forward, firing 'ended' in end order, one quantum late. */
     async advance(seconds: number): Promise<void> {
+        if (this.state !== 'running') {
+            throw new Error(`advance() on a ${this.state} AudioContext: its clock is frozen`);
+        }
         const target = this.currentTime + seconds;
         for (;;) {
             const next = this.sources
