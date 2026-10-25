@@ -80,6 +80,17 @@ constructor-injected deps (`client/src/deps.ts`) or inlined helpers, and the
 fork-only `appSettings.enableWebAudioGapless()` becomes a localStorage read that
 defaults to enabled.
 
+## Client tests
+
+`npm test` bundles `client/test/*.test.ts` with the real player and runs them
+on `node:test`. `test/fakes.ts` provides a Web Audio context with a manual
+clock (`advance()` fires `onended` in end order, one render quantum late),
+`holdFetch()`/`holdDecode()` to delay a track's download or (non-abortable)
+decode, tracks that fail to decode, and an events/playbackManager pair that
+mirrors stock jellyfin-web (it destroys the player when it cannot play the
+announced next item). Tests assert the itemstarted/itemstopped log, positions,
+audible sources and handoffs. Add a test for every pairing or start/pause fix.
+
 ## Build matrix
 
 Support policy: only the current official Jellyfin release line (12.x) is
@@ -111,7 +122,7 @@ is why it works. Do not "simplify" it back.
 ```sh
 # client
 docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work -w /work/client \
-  node:24-bookworm sh -lc 'npm ci && npm run typecheck && npm run build'
+  node:24-bookworm sh -lc 'npm ci && npm run typecheck && npm test && npm run build'
 
 # C# jf12
 docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work -w /work \
@@ -208,7 +219,8 @@ current release is confirmed working end-to-end.
 - Runtime verification on a real server (see the fork HANDOFF's test matrix:
   album switch mid-play, repeat One/All at boundaries, shuffle mid-play,
   queue-next / remove-current / reorder, throttled-network boundary recovery).
-  Also the non-blocking starts (no automated client tests exist): on a
+  Also, in a real browser (the client tests cover the logic, not real decoders,
+  networks or AudioContext suspension), the non-blocking starts: on a
   throttled network, seek into the last 30 s while the next track is still
   downloading (starts at once, gapless if the decode lands first); seek during
   the initial load (also back to exactly the start position, and after a
@@ -225,10 +237,6 @@ current release is confirmed working end-to-end.
   track's `_schedule` entry bound to a retired `_playbackId`, so its successor
   is never scheduled. Needs an
   explicit pending-start state that `pause()` and mutations can see.
-- No automated client tests: the start/stop pairing is verified by reading and
-  manual browser runs only. A Node harness with a fake `AudioContext` (manual
-  clock, controllable `decodeAudioData`, triggerable `onended`), a stubbed
-  `fetch` and an `events.trigger` recorder would cover it.
 - ReplayGain / audio normalization: the stock player applies the item's
   normalization gain; ours plays at raw level (volume-only `GainNode`). Parked
   until it is known to matter.

@@ -20,3 +20,6 @@ artifacts/
 
 # Local Chrome DevTools overrides (contain server host names)
 chrome_overrides/
+
+# client test bundles
+client/.test-build/
