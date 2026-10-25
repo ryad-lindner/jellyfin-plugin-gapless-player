@@ -810,6 +810,61 @@ test('an undecodable target of a restarted waiting skip hands off once', async (
     await flush();
 
     assert.equal(h.handoffs.length, 1);
-    assert.deepEqual(h.handoffs[0].items.map(i => i.Id), ['B', 'C']);
+    assert.deepEqual(h.handoffs[0].items.map(i => i.Id), ['B', 'Y', 'C']);
     assert.deepEqual(h.log(), ['start A', 'stop A@0>B']);
+});
+
+test('play next during a waiting skip queues after the skip target', async () => {
+    const h = createHarness();
+    await playAlbum(h, [track('A', 120), track('B', 60), track('C', 90)]);
+    await h.ctx().advance(10 + START_LEAD_SEC);
+
+    const release = h.ctx().suspendUntilReleased();
+    void h.player.nextTrack();
+    h.player.queueNext([track('Y', 60)]);
+    release();
+    await flush();
+    assert.deepEqual(h.player.getPlaylistSync().map(i => i.Id), ['A', 'B', 'Y', 'C']);
+
+    await h.ctx().advance(61);
+    assert.deepEqual(h.ctx().audible(), ['Y']);
+    assert.deepEqual(h.log(), ['start A', 'stop A@10000>B', 'start B', 'stop B@60000>Y', 'start Y']);
+});
+
+test('play next during a waiting previous queues after the earlier target', async () => {
+    const h = createHarness();
+    await playAlbum(h, [track('A', 120), track('B', 90), track('C', 90)], 1);
+    await h.ctx().advance(1 + START_LEAD_SEC);
+
+    const release = h.ctx().suspendUntilReleased();
+    void h.player.previousTrack();
+    h.player.queueNext([track('Y', 60)]);
+    assert.equal(h.player.currentItem()?.Id, 'B');
+    release();
+    await flush();
+    assert.deepEqual(h.player.getPlaylistSync().map(i => i.Id), ['A', 'Y', 'B', 'C']);
+
+    await h.ctx().advance(121);
+    assert.deepEqual(h.ctx().audible(), ['Y']);
+    assert.deepEqual(h.log(), ['start B', 'stop B@1000>A', 'start A', 'stop A@120000>Y', 'start Y']);
+});
+
+test('play next during a waiting RepeatAll wrap shifts the playing item by all inserts', async () => {
+    const h = createHarness();
+    await playAlbum(h, [track('A', 120), track('B', 90), track('C', 90)], 2);
+    h.player.setRepeatMode('RepeatAll');
+    await h.ctx().advance(10 + START_LEAD_SEC);
+
+    const release = h.ctx().suspendUntilReleased();
+    void h.player.nextTrack();
+    h.player.queueNext([track('Y', 60), track('Z', 60)]);
+    assert.equal(h.player.currentItem()?.Id, 'C');
+    assert.equal(Math.round(h.player.currentTime()), 10_000);
+    release();
+    await flush();
+    assert.deepEqual(h.player.getPlaylistSync().map(i => i.Id), ['A', 'Y', 'Z', 'B', 'C']);
+
+    await h.ctx().advance(121);
+    assert.deepEqual(h.ctx().audible(), ['Y']);
+    assert.deepEqual(h.log(), ['start C', 'stop C@10000>A', 'start A', 'stop A@120000>Y', 'start Y']);
 });

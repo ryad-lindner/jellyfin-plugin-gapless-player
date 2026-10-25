@@ -764,8 +764,14 @@
       this._events.trigger(this, "playlistitemadd");
     }
     queueNext(items) {
-      this._playlist.splice(this._currentIndex + 1, 0, ...clonePlaylistItems(items, true));
-      this._handlePlaylistMutation(this._currentIndex);
+      const anchor = this._pendingTarget()?.index ?? this._currentIndex;
+      const added = clonePlaylistItems(items, true);
+      const oldCurrentIndex = this._currentIndex;
+      this._playlist.splice(anchor + 1, 0, ...added);
+      if (anchor < oldCurrentIndex) {
+        this._currentIndex += added.length;
+      }
+      this._handlePlaylistMutation(oldCurrentIndex);
       this._events.trigger(this, "playlistitemadd");
     }
     removeFromPlaylist(playlistItemIds) {
