@@ -76,7 +76,11 @@ async function restartCurrentQueue(enabled: boolean): Promise<boolean> {
 
         // When switching to the normal player, strip the gapless preset source
         // so it resolves a fresh media source instead of the raw stream URL.
-        const items = enabled ? raw : raw.map(it => stripPresetSource(it as Record<string, unknown>));
+        // When re-enabling, drop the plugin's fallback mark (set on an
+        // undecodable-track handoff) so the gapless player may claim the queue.
+        const items = raw.map(it => (enabled
+            ? { ...(it as Record<string, unknown>), GaplessFallback: undefined }
+            : stripPresetSource(it as Record<string, unknown>)));
 
         const index = typeof pm.getCurrentPlaylistIndex === 'function' ? Number(pm.getCurrentPlaylistIndex()) : 0;
         const positionMs = typeof pm.currentTime === 'function' ? Number(pm.currentTime()) : 0;

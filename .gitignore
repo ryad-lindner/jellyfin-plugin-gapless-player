@@ -17,3 +17,6 @@ artifacts/
 # Editor
 .vs/
 .idea/
+
+# Local Chrome DevTools overrides (contain server host names)
+chrome_overrides/

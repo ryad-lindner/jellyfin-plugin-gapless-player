@@ -195,7 +195,7 @@
       if (!Array.isArray(raw) || raw.length === 0) {
         return false;
       }
-      const items = enabled ? raw : raw.map((it) => stripPresetSource(it));
+      const items = raw.map((it) => enabled ? { ...it, GaplessFallback: void 0 } : stripPresetSource(it));
       const index = typeof pm.getCurrentPlaylistIndex === "function" ? Number(pm.getCurrentPlaylistIndex()) : 0;
       const positionMs = typeof pm.currentTime === "function" ? Number(pm.currentTime()) : 0;
       await pm.play({
@@ -276,8 +276,12 @@
   function getStreamUrl(item) {
     return item?.PresetMediaSource?.StreamUrl || item?.PresetMediaSource?.Path || item?.Url || item?.Path;
   }
-  function clonePlaylistItems(items) {
-    return (items || []).map((item) => ({ ...item }));
+  var nextPlaylistItemId = 0;
+  function clonePlaylistItems(items, freshIds = false) {
+    return (items || []).map((item) => ({
+      ...item,
+      PlaylistItemId: !freshIds && item.PlaylistItemId || `gaplessItem${nextPlaylistItemId++}`
+    }));
   }
   function isGaplessItem(item) {
     return item != null;
@@ -333,10 +337,8 @@
       // A seek landed during the load window; the deferred start then skips the
       // blocking next-track wait, like a seek while playing.
       this._seekedWhileLoading = false;
-      // Key of the item the last itemstarted was fired for; lets _startFrom
-      // detect that the item under _currentIndex changed (e.g. remove-current)
-      // even when the index did not.
-      this._startedItemKey = null;
+      // waitForNext of the latest _startFrom, for restarting it after a mutation.
+      this._startWaitsForNext = true;
       this._lastProgressTriggerMs = 0;
       this._scheduled = /* @__PURE__ */ new Map();
       this._scheduledStartTimes = /* @__PURE__ */ new Map();
@@ -344,7 +346,13 @@
       this._volume = 100;
       this._muted = false;
       this._isPaused = true;
-      this._started = false;
+      // Stop reporting: the item announced by itemstarted and not yet stopped,
+      // the next item a boundary itemstopped promised but which has not started
+      // yet (boundary recovery), and the position at which the reported item's
+      // audio was interrupted by a start still in flight.
+      this._reportedItem = null;
+      this._awaitedItem = null;
+      this._interruptedAtMs = null;
       this._repeatMode = "RepeatNone";
       this._shuffleMode = "Sorted";
       this._audioStreamIndex = null;
@@ -404,7 +412,7 @@
       if (!this.isGaplessEnabled()) {
         return false;
       }
-      if (playOptions.enableWebAudioGapless === false) {
+      if (playOptions.enableWebAudioGapless === false || item?.GaplessFallback) {
         return false;
       }
       if (!getAudioContextConstructor()) {
@@ -413,7 +421,7 @@
       if (playOptions.items) {
         return playOptions.items.length > 1 && playOptions.items.every((i) => i?.MediaType === "Audio" && isFiniteDuration(i));
       }
-      return this._playlist.length > 1 && item?.MediaType === "Audio" && isFiniteDuration(item) && this._playlist.some((i) => item.Id != null && i.Id === item.Id || item.PlaylistItemId != null && i.PlaylistItemId === item.PlaylistItemId);
+      return item?.MediaType === "Audio" && isFiniteDuration(item) && this._playlist.some((i) => item.Id != null && i.Id === item.Id || item.PlaylistItemId != null && i.PlaylistItemId === item.PlaylistItemId);
     }
     getDeviceProfile(item) {
       if (this._appHost.getDeviceProfile) {
@@ -422,8 +430,6 @@
       return {};
     }
     async play(options) {
-      const supersededItem = this._loadingItem;
-      this._loadingItem = null;
       await this.stop(false);
       this._playOptions = options || {};
       this._playlist = clonePlaylistItems(options.items || [options.item].filter(isGaplessItem));
@@ -435,56 +441,68 @@
       this._repeatMode = "RepeatNone";
       this._shuffleMode = "Sorted";
       if (!this._playlist.length) {
-        if (supersededItem) {
-          this._emitItemStopped(supersededItem, null);
-        }
         return Promise.reject(new Error("No items to play"));
       }
       this.debugLog("starting gapless queue", {
         items: this._playlist.length,
         startIndex: this._currentIndex
       });
-      if (supersededItem) {
-        this._emitItemStopped(supersededItem, this.currentItem());
-      }
-      this._started = true;
       this._loadingItem = this.currentItem();
       this._seekedWhileLoading = false;
-      this._startedItemKey = itemKey(this._loadingItem);
-      this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
-      await this._ensureAudioGraph();
+      this._emitItemStarted();
+      const loadId = this._playbackId;
       try {
+        await this._ensureAudioGraph();
         await this._decodeIndex(this._currentIndex);
       } catch (err) {
-        if (isAbortError(err)) {
+        if (isAbortError(err) || loadId !== this._playbackId) {
           return;
         }
         console.warn(`${LOG_PREFIX3} initial decode failed; handing off to normal playback`, err);
         this._handoffToNormalPlayback(this._currentIndex, Math.round(this._basePositionMs * TICKS_PER_MS));
         return;
       }
+      if (!this._loadingItem || loadId !== this._playbackId) {
+        return;
+      }
       this._preloadNext();
       await this._startFrom(this._currentIndex, this._basePositionMs, { waitForNext: !this._seekedWhileLoading });
     }
+    /**
+     * playbackManager relies on a self-managed player's itemstopped for both
+     * stop(true) and the stop(false) before a play() on this player: it only
+     * reports players whose playlist it manages. stop(false) must report
+     * synchronously, while playbackManager's stream state still exists (it
+     * clears it right after), and names the replaced item as next so
+     * playbackManager keeps this player. A never-started awaited item is not
+     * owed there.
+     */
     stop(destroyPlayer) {
-      this._abandonOptimisticStart();
+      const owed = this._owedStop();
+      const replacing = !destroyPlayer && owed?.started ? owed : null;
+      this._resetReportState();
       this._playbackId++;
       this._stopScheduledSources();
       this._stopTimeUpdates();
       this._clearDecodedAfterMutation();
       this._isPaused = true;
-      this._started = false;
-      this._startedItemKey = null;
       this._lastProgressTriggerMs = 0;
       this._pausePositionMs = 0;
       if (destroyPlayer) {
         this._clearPlaylistState();
         this.destroy();
       }
+      if (destroyPlayer && owed) {
+        this._emitItemStopped(owed.item, null, owed.positionMs);
+      } else if (replacing) {
+        this._emitItemStopped(replacing.item, replacing.item, replacing.positionMs);
+        this._awaitedItem = null;
+      }
       return Promise.resolve();
     }
     destroy() {
-      this._abandonOptimisticStart();
+      this._resetReportState();
+      this._isPaused = true;
       this._playbackId++;
       this._stopScheduledSources();
       this._stopTimeUpdates();
@@ -499,10 +517,16 @@
       this._gainNode = null;
     }
     pause() {
-      if (this._isPaused) {
+      if (this._isPaused && !this._loadingItem) {
         return;
       }
       this._pausePositionMs = this.getCurrentTimeMs();
+      if (this._reportedItem && itemKey(this._reportedItem) === itemKey(this.currentItem())) {
+        this._interruptedAtMs = null;
+      }
+      this._loadingItem = null;
+      this._seekedWhileLoading = false;
+      this._playbackId++;
       this._stopScheduledSources();
       this._stopTimeUpdates();
       this._isPaused = true;
@@ -512,7 +536,7 @@
       return this.unpause();
     }
     unpause() {
-      if (!this._isPaused) {
+      if (!this._isPaused || !this._playlist.length) {
         return Promise.resolve();
       }
       return this._startFrom(this._currentIndex, this._pausePositionMs, { waitForNext: false });
@@ -532,7 +556,10 @@
       if (this._isPaused || !this._audioContext) {
         return this._pausePositionMs;
       }
-      return this._basePositionMs + (this._audioContext.currentTime - this._baseContextTime) * 1e3;
+      if (!this._scheduled.has(this._currentIndex)) {
+        return this._basePositionMs;
+      }
+      return this._basePositionMs + Math.max(0, (this._audioContext.currentTime - this._baseContextTime) * 1e3);
     }
     duration() {
       const ticks = this.currentMediaSource()?.RunTimeTicks || this.currentItem()?.RunTimeTicks;
@@ -709,7 +736,7 @@
       return this._startFrom(Math.max(0, this._currentIndex - 1), 0);
     }
     queue(items) {
-      this._playlist.push(...clonePlaylistItems(items));
+      this._playlist.push(...clonePlaylistItems(items, true));
       if (!this._isPaused) {
         this._scheduleLookaheadForCurrent();
         this._preloadNext();
@@ -717,7 +744,7 @@
       this._events.trigger(this, "playlistitemadd");
     }
     queueNext(items) {
-      this._playlist.splice(this._currentIndex + 1, 0, ...clonePlaylistItems(items));
+      this._playlist.splice(this._currentIndex + 1, 0, ...clonePlaylistItems(items, true));
       this._handlePlaylistMutation(this._currentIndex);
       this._events.trigger(this, "playlistitemadd");
     }
@@ -727,6 +754,9 @@
       const currentItemId = this.getCurrentPlaylistItemId();
       const isCurrentRemoved = currentItemId != null && ids.has(currentItemId);
       const removedBeforeCurrent = this._playlist.slice(0, oldCurrentIndex).filter((item) => item.PlaylistItemId && ids.has(item.PlaylistItemId)).length;
+      if (isCurrentRemoved && this._reportedItem && this._interruptedAtMs == null) {
+        this._interruptedAtMs = this.getCurrentTimeMs();
+      }
       this._playlist = this._playlist.filter((item) => !item.PlaylistItemId || !ids.has(item.PlaylistItemId));
       this._currentIndex = Math.min(
         Math.max(0, oldCurrentIndex - removedBeforeCurrent),
@@ -801,7 +831,7 @@
         this._decoded.set(newCurrentIndex, currentBuffer);
       }
       if (this._loadingItem) {
-        const playbackId = this._playbackId;
+        const playbackId = ++this._playbackId;
         this._decodeIndex(newCurrentIndex).then(() => {
           if (playbackId !== this._playbackId || !this._loadingItem) {
             return Promise.resolve();
@@ -812,8 +842,13 @@
             return;
           }
           console.error(`${LOG_PREFIX3} failed to restart load after playlist mutation`, err);
-          this._handoffToNormalPlayback(newCurrentIndex);
+          this._handoffToNormalPlayback(newCurrentIndex, Math.round(this._pausePositionMs * TICKS_PER_MS));
         });
+        return;
+      }
+      if (!this._isPaused && !currentSource) {
+        this._playbackId++;
+        this._recoverAtIndex(newCurrentIndex, this._basePositionMs, { waitForNext: this._startWaitsForNext });
         return;
       }
       if (!this._isPaused) {
@@ -972,26 +1007,46 @@
      * the boundary recovers in place.
      */
     async _startFrom(index, positionMs, { waitForNext = true } = {}) {
-      await this._ensureAudioGraph();
-      const audioContext = this._audioContext;
-      if (!audioContext) {
-        throw new Error("AudioContext was not initialized");
+      this._playbackId++;
+      const playbackId = this._playbackId;
+      const targetKey = itemKey(this._playlist[index]);
+      const handOff = (err) => {
+        if (isAbortError(err) || playbackId !== this._playbackId) {
+          return;
+        }
+        console.error(`${LOG_PREFIX3} failed to start; handing off to normal playback`, err);
+        this._handoffToNormalPlayback(index, Math.round(positionMs * TICKS_PER_MS));
+      };
+      try {
+        await this._ensureAudioGraph();
+      } catch (err) {
+        handOff(err);
+        return;
       }
-      const previousIndex = this._currentIndex;
+      if (itemKey(this._playlist[index]) !== targetKey) {
+        const movedIndex = this._playlist.findIndex((i) => itemKey(i) === targetKey);
+        if (movedIndex < 0) {
+          return;
+        }
+        index = movedIndex;
+      }
+      const audioContext = this._audioContext;
+      if (playbackId !== this._playbackId || !audioContext) {
+        return;
+      }
+      if (this._reportedItem && this._interruptedAtMs == null) {
+        this._interruptedAtMs = this.getCurrentTimeMs();
+      }
       this._stopScheduledSources();
       this._stopTimeUpdates();
       this._currentIndex = index;
-      this._playbackId++;
-      const playbackId = this._playbackId;
+      this._startWaitsForNext = waitForNext;
       this._basePositionMs = positionMs;
       this._pausePositionMs = positionMs;
-      this._baseContextTime = audioContext.currentTime;
       this._isPaused = false;
       const currentBuffer = await this._decodeIndex(index).catch((err) => {
-        if (isAbortError(err)) {
-          return null;
-        }
-        throw err;
+        handOff(err);
+        return null;
       });
       if (!currentBuffer) {
         return;
@@ -1006,6 +1061,7 @@
       const startedAt = audioContext.currentTime + 0.05;
       const endsAt = startedAt + currentBuffer.duration - positionMs / 1e3;
       this._scheduleIndex(index, currentBuffer, startedAt, positionMs / 1e3, playbackId);
+      this._baseContextTime = startedAt;
       this._schedule.set(index, { startTime: startedAt - positionMs / 1e3, playbackId });
       const nextIndex = this._nextIndex(index);
       if (nextIndex != null && nextIndex !== index) {
@@ -1015,16 +1071,20 @@
       this._preloadNext();
       this._startTimeUpdates();
       const startedItem = this.currentItem();
-      const itemChanged = itemKey(startedItem) !== this._startedItemKey;
-      if (itemChanged) {
+      if (this._loadingItem && itemKey(this._loadingItem) !== itemKey(startedItem)) {
         this._abandonOptimisticStart(startedItem);
       } else {
         this._loadingItem = null;
       }
-      if (!this._started || previousIndex !== index || itemChanged) {
-        this._started = true;
-        this._startedItemKey = itemKey(startedItem);
-        this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
+      if (this._reportedItem && itemKey(this._reportedItem) !== itemKey(startedItem)) {
+        this._emitItemStopped(this._reportedItem, startedItem, this._interruptedAtMs ?? 0);
+      }
+      if (playbackId !== this._playbackId) {
+        return;
+      }
+      this._interruptedAtMs = null;
+      if (!this._reportedItem) {
+        this._emitItemStarted();
       } else {
         this._events.trigger(this, "timeupdate");
       }
@@ -1094,31 +1154,23 @@
       const item = this._playlist[index];
       const nextIndex = this._nextIndex(index);
       const nextItem = nextIndex != null ? this._playlist[nextIndex] : null;
+      const endPositionMs = item?.RunTimeTicks ? item.RunTimeTicks / TICKS_PER_MS : 0;
       if (nextIndex == null || !nextItem) {
         this._isPaused = true;
-        this._events.trigger(this, "itemstopped", [{
-          item,
-          mediaSource: getMediaSource(item),
-          positionMs: item?.RunTimeTicks ? item.RunTimeTicks / TICKS_PER_MS : 0,
-          nextItem: null,
-          nextMediaType: null
-        }]);
+        this._emitItemStopped(item, null, endPositionMs);
         return;
       }
       const nextStartTime = this._scheduledStartTimes.get(nextIndex);
       const isNextScheduled = nextStartTime != null && nextStartTime <= audioContext.currentTime + 0.25;
       const isNextDecoded = this._decoded.has(nextIndex);
-      this._events.trigger(this, "itemstopped", [{
-        item,
-        mediaSource: getMediaSource(item),
-        positionMs: item?.RunTimeTicks ? item.RunTimeTicks / TICKS_PER_MS : 0,
-        nextItem: { item: nextItem },
-        nextMediaType: nextItem.MediaType
-      }]);
+      this._emitItemStopped(item, nextItem, endPositionMs);
       if (playbackId !== this._playbackId) {
         return;
       }
       if (!isNextScheduled && !isNextDecoded) {
+        this._currentIndex = nextIndex;
+        this._basePositionMs = 0;
+        this._pausePositionMs = 0;
         console.warn(`${LOG_PREFIX3} boundary missed; recovering in place`, {
           index,
           nextIndex,
@@ -1148,8 +1200,7 @@
         index: this._currentIndex,
         name: this.currentItem()?.Name
       });
-      this._startedItemKey = itemKey(this.currentItem());
-      this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
+      this._emitItemStarted();
       this._preloadNext();
       this._pruneDecoded();
     }
@@ -1161,24 +1212,29 @@
      * requests race (e.g. a stale handoff resuming the old album over a newly
      * selected one), so this stays inside the plugin whenever possible.
      */
-    _recoverAtIndex(index) {
+    _recoverAtIndex(index, positionMs = 0, { waitForNext = true } = {}) {
       const playbackId = this._playbackId;
+      this._startWaitsForNext = waitForNext;
       this._decodeIndex(index).then(() => {
         if (playbackId !== this._playbackId) {
           return;
         }
-        return this._startFrom(index, 0);
+        return this._startFrom(index, positionMs, { waitForNext });
       }).catch((err) => {
         if (isAbortError(err) || playbackId !== this._playbackId) {
           return;
         }
         console.error(`${LOG_PREFIX3} failed to recover gapless playback`, err);
-        this._handoffToNormalPlayback(index);
+        this._handoffToNormalPlayback(index, Math.round(positionMs * TICKS_PER_MS));
       });
     }
     _handoffToNormalPlayback(startIndex, startPositionTicks = 0) {
-      const items = this._playlist.slice(startIndex).map(stripPresetSource2);
-      this._abandonOptimisticStart(this._playlist[startIndex] ?? null);
+      const items = this._playlist.slice(startIndex).map((item) => ({ ...stripPresetSource2(item), GaplessFallback: true }));
+      const owed = this._owedStop();
+      if (owed?.started) {
+        this._emitItemStopped(owed.item, this._playlist[startIndex] ?? null, owed.positionMs);
+      }
+      this._resetReportState();
       this._isPaused = true;
       this._stopScheduledSources();
       this._stopTimeUpdates();
@@ -1312,7 +1368,7 @@
     }
     /**
      * Fires the itemstopped that pairs with an optimistic itemstarted whose
-     * audio never started (superseded play, stop, or fallback handoff).
+     * audio never started because a different item started.
      * playbackManager only resets its per-item stream state on the next
      * itemstarted, so skipping this would leave a dangling play session on
      * the server. No-op outside the load window.
@@ -1323,13 +1379,41 @@
         return;
       }
       this._loadingItem = null;
-      this._emitItemStopped(item, nextItem);
+      this._emitItemStopped(item, nextItem, this._interruptedAtMs ?? this._pausePositionMs);
     }
-    _emitItemStopped(item, nextItem) {
+    _owedStop() {
+      if (this._loadingItem) {
+        return { item: this._loadingItem, positionMs: this._interruptedAtMs ?? this._pausePositionMs, started: true };
+      }
+      if (this._reportedItem) {
+        return { item: this._reportedItem, positionMs: this._interruptedAtMs ?? this.getCurrentTimeMs(), started: true };
+      }
+      if (this._awaitedItem) {
+        return { item: this._awaitedItem, positionMs: 0, started: false };
+      }
+      return null;
+    }
+    _resetReportState() {
+      this._loadingItem = null;
+      this._reportedItem = null;
+      this._awaitedItem = null;
+      this._interruptedAtMs = null;
+    }
+    _emitItemStarted() {
+      this._reportedItem = this.currentItem();
+      this._awaitedItem = null;
+      this._interruptedAtMs = null;
+      this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
+    }
+    _emitItemStopped(item, nextItem, positionMs = 0) {
+      this._reportedItem = null;
+      this._awaitedItem = nextItem;
       this._events.trigger(this, "itemstopped", [{
         item,
         mediaSource: getMediaSource(item),
-        positionMs: 0,
+        // Whole ms: playbackManager reports positionMs * 10000 as Int64
+        // ticks, and a fractional value fails the server's validation (400).
+        positionMs: Math.round(positionMs),
         nextItem: nextItem ? { item: nextItem } : null,
         nextMediaType: nextItem ? nextItem.MediaType : null
       }]);

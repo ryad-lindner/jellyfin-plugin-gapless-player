@@ -70,6 +70,8 @@ The load-bearing ones:
 5. Seek while paused must not unpause.
 6. `AbortError` means "superseded", never a real failure.
 7. `_nextIndex` centralizes repeat-mode successor logic.
+8. No scheduled source for `_currentIndex` means a start is in flight;
+   `getCurrentTimeMs()` then returns the target position, not a running clock.
 
 When porting fixes from the jellyfin-web fork, the player logic is identical
 except that fork module imports (`Events`, `appSettings`, `playbackManager`,
@@ -210,13 +212,23 @@ current release is confirmed working end-to-end.
   throttled network, seek into the last 30 s while the next track is still
   downloading (starts at once, gapless if the decode lands first); seek during
   the initial load (also back to exactly the start position, and after a
-  remove/reorder during the load); rapid pause/unpause/seek near the end.
-- Pause while a start is in flight (a seek/unpause still decoding, or boundary
-  recovery waiting for the next item) does not stop that start: audio begins
-  behind the pause. Just bumping `_playbackId` in `pause()` is NOT enough; it
-  strands `_loadingItem` (paused() stays false), saves a pause position that
-  counted the wait, and resumes recovery on the old index (duplicate
-  itemstopped). Needs an explicit "start pending" state in `_startFrom`.
+  remove/reorder during the load); rapid pause/unpause/seek near the end;
+  pause during the initial load, a seek/next decode and a boundary recovery
+  wait (must stay silent, unpause resumes at the target position). Undecodable
+  tracks (must hand off once to the normal player, with one itemstopped for
+  the item that was announced): as the first track, after a pause during its
+  load then unpause, and via next/select; remove-current during the load.
+- Starts that wait for a suspended AudioContext to resume (mobile background
+  interruptions) are not fully pause-safe: a pause during a seek's wait saves
+  the pre-seek position; a pause or seek during an unpause's wait is ignored;
+  a next/select whose target is removed during the wait leaves the current
+  track's `_schedule` entry bound to a retired `_playbackId`, so its successor
+  is never scheduled. Needs an
+  explicit pending-start state that `pause()` and mutations can see.
+- No automated client tests: the start/stop pairing is verified by reading and
+  manual browser runs only. A Node harness with a fake `AudioContext` (manual
+  clock, controllable `decodeAudioData`, triggerable `onended`), a stubbed
+  `fetch` and an `events.trigger` recorder would cover it.
 - ReplayGain / audio normalization: the stock player applies the item's
   normalization gain; ours plays at raw level (volume-only `GainNode`). Parked
   until it is known to matter.
