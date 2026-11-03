@@ -30,35 +30,87 @@ without gaps. The normal HTML audio player stays as the fallback.
 - Jellyfin server **12.x** (the current official release line), at least the
   version the release was built against (currently 12.3); the catalog hides it
   from older servers.
-- Jellyfin 10.11 is **frozen and unsupported**: its last build is 0.1.0.5 and it
-  gets no further features or fixes.
+- Jellyfin 10.11 is **frozen and unsupported**: its last build is 0.1.0.5
+  (needs 10.11.11 or later) and it gets no further features or fixes.
 - A browser with Web Audio support (all current browsers).
 - The web client served by the same server (default deployments).
 
 ## Installation
 
-Install from a plugin repository, then restart the server once so Jellyfin
-loads the plugin.
+Two ways: from the plugin repository (recommended, gets updates) or manually
+from a release zip. Both need one server restart and a hard refresh of the web
+client. Injection itself is live (response rewriting): only the initial plugin
+load needs a server restart; later enable/disable changes need a web-client
+reload.
 
-1. In Jellyfin: **Dashboard → Plugins → Repositories → +**
-2. Add the manifest URL that matches your server major:
-   - Jellyfin **12.x**: `<your-repo-base>/manifest.json`
-   - Jellyfin **10.11.x** (frozen at 0.1.0.5): `<your-repo-base>/manifest-10.json`
-3. **Dashboard → Plugins → Catalog → Gapless Player → Install**.
+### From the plugin repository
+
+1. In Jellyfin: **Dashboard → Plugins → Manage Repositories → New Repository**.
+2. Add the manifest URL that matches your server (any name works):
+
+   | Jellyfin | Manifest URL |
+   |----------|--------------|
+   | 12.x ([minimum version](#requirements)) | `https://raw.githubusercontent.com/ryad-lindner/jellyfin-plugin-repo/main/manifest.json` |
+   | 10.11.11 or later 10.11.x (frozen at 0.1.0.5) | `https://raw.githubusercontent.com/ryad-lindner/jellyfin-plugin-repo/main/manifest-10.json` |
+
+   Use the raw URL exactly as shown, not the GitHub page of the repository.
+3. **Dashboard → Plugins**, search for *Gapless Player* (or filter
+   *Available*), open it and click **Install**.
 4. **Restart the server** once, so Jellyfin loads the plugin assembly.
-5. Hard-refresh the web client (clear cache) so the rewritten `index.html` and
-   `config.json` are reloaded.
-
-Injection itself is live (response rewriting): only the initial plugin load
-needs a server restart; later enable/disable changes need a web-client reload.
+5. [Hard-refresh the web client](#hard-refresh-the-web-client).
 
 Each Jellyfin major has its own build and its own manifest, so a server only
 ever sees a compatible version.
 
+### Manual install
+
+1. Download the zip for your server from the
+   [releases](https://github.com/ryad-lindner/jellyfin-plugin-gapless-player/releases):
+   the latest `gapless-player_<version>-jf12.zip` for Jellyfin 12.x (see
+   [Requirements](#requirements)), `gapless-player_0.1.0.5-jf10.zip` from the
+   [v0.1.0.5 release](https://github.com/ryad-lindner/jellyfin-plugin-gapless-player/releases/tag/v0.1.0.5)
+   for Jellyfin 10.11.11 or later 10.11.x.
+2. Create a folder for it, for example `GaplessPlayer_<version>`, in the
+   `plugins` directory inside Jellyfin's data directory. Common locations:
+   - Docker (official image): `/config/plugins`
+   - Docker (linuxserver.io image): `/config/data/plugins`
+   - Debian/Ubuntu package: `/var/lib/jellyfin/plugins`
+   - Windows installer: `C:\ProgramData\Jellyfin\Server\plugins`
+3. Unzip `Jellyfin.Plugin.GaplessPlayer.dll` and `meta.json` into that folder.
+   The files must be readable by the user Jellyfin runs as.
+4. **Restart the server**. **Dashboard → Plugins** now lists Gapless Player.
+5. [Hard-refresh the web client](#hard-refresh-the-web-client).
+
+Manual installs do not update themselves: to upgrade, delete the old folder,
+add the new version the same way and restart. To get updates in the dashboard
+instead, add the repository as above.
+
+### Hard refresh the web client
+
+The browser caches the web client, so it keeps running without the plugin
+until the cached `index.html` and `config.json` are reloaded. After installing
+(or uninstalling), clear the cache for your Jellyfin site and reload, for
+example with **Ctrl+Shift+R** (**Cmd+Shift+R** on macOS), or in Chrome with
+DevTools open: right-click the reload button → **Empty cache and hard reload**.
+
+### Troubleshooting
+
+- **"An error occurred while getting the plugin details from the repository"**
+  on the Gapless Player plugin page: no configured repository lists the
+  plugin, typically after a manual install. It is harmless; the plugin still
+  works. To clear it (and get updates), add the matching manifest URL from the
+  [table above](#from-the-plugin-repository). If you already added one, check
+  it is the raw URL, not the GitHub page of the repository.
+- **Installed, but tracks still have gaps**: hard-refresh the web client (see
+  above), check that **Enabled** is on in the plugin
+  [settings](#configuration), that the ∞ toggle in the now-playing bar is on,
+  and that the queue is [eligible](#how-it-works).
+
 ### Uninstalling
 
-Uninstall from the plugin catalog, restart the server and reload the web
-client. Nothing is written to the web root, so there is nothing to clean up.
+Uninstall from **Dashboard → Plugins** (or delete the plugin folder for a
+manual install), restart the server and reload the web client. Nothing is
+written to the web root, so there is nothing to clean up.
 
 ## Usage
 

@@ -144,8 +144,9 @@ Source of truth is a private git host, mirrored to a public GitHub repo that the
 Jellyfin plugin installer can fetch anonymously. One manifest per Jellyfin major
 (`manifest.json` = 12, `manifest-10.json` = 10.11) so a server only sees a
 compatible build. `manifest-10.json` is frozen at 0.1.0.5. `scripts/build.sh`
-produces the jf12 zip and its manifest fields. Manifest hosting/URLs are
-deployment config and are kept out of this repo.
+produces the jf12 zip and its manifest fields. The public manifest URLs
+(raw GitHub files of the plugin-repo) are documented in the README install
+section; keep them in sync if the hosting moves.
 
 ## Release steps
 
@@ -173,7 +174,8 @@ GitHub mirror's releases; the manifests live in a separate plugin-repo repo
    --notes-file <notes> artifacts/gapless-player_<version>-jf12.zip`. Notes:
    intro line, `## Features`, `## Install`, `## Downloads` (the zip with its
    targetAbi) — copy the previous release's notes and edit; list only the
-   jf12 zip (drop any jf10 line carried over from v0.1.0.5).
+   jf12 zip (drop any jf10 line carried over from v0.1.0.5). `## Install`
+   must give the raw manifest URL and link the README install section.
 5. **Manifests**: in the plugin-repo, set `version`, `changelog`, `targetAbi`,
    `sourceUrl`, `checksum` and `timestamp` of the manifest entry from the
    build output (`manifest.json` ← jf12 zip; `manifest-10.json` stays
