@@ -36,10 +36,11 @@ export class TrackAudio {
         private readonly _abortController: AbortController | null = null
     ) {}
 
-    static fromBuffer(buffer: AudioBuffer): TrackAudio {
-        const track = new TrackAudio(buffer.duration);
-        track.chunks.push({ startTime: 0, buffer, duration: buffer.duration });
-        track._decodedDuration = buffer.duration;
+    static fromBuffer(buffer: AudioBuffer, maxDuration = Infinity): TrackAudio {
+        const duration = Math.min(buffer.duration, snapToFrame(maxDuration, buffer.sampleRate));
+        const track = new TrackAudio(duration);
+        track.chunks.push({ startTime: 0, buffer, duration });
+        track._decodedDuration = duration;
         track.finish();
         return track;
     }

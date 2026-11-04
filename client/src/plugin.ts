@@ -244,6 +244,11 @@ class ByteStream {
         return this.bytes();
     }
 
+    cancel(): void {
+        this.done = true;
+        this._reader.cancel().catch(() => undefined);
+    }
+
     release(): void {
         this._retain = false;
         this._parts = [];
@@ -1258,8 +1263,12 @@ class WebAudioGaplessPlayer {
             probe = probeFlac(stream.bytes());
         }
 
+        let maxDuration = Infinity;
         if (probe.kind === 'flac') {
             const { header } = probe;
+            if (header.totalSamples > 0) {
+                maxDuration = header.totalSamples / header.sampleRate;
+            }
             if (this._audioContext && header.sampleRate !== this._audioContext.sampleRate && this._canSwitchContextRate(index)) {
                 await this._switchContextRate(header.sampleRate, index, abortController.signal);
                 // The wait does not notice an abort; a superseded load must not resolve.
@@ -1267,14 +1276,15 @@ class WebAudioGaplessPlayer {
             }
             const audioContext = this._audioContext;
             if (audioContext && header.sampleRate === audioContext.sampleRate && header.totalSamples > 0) {
-                return this._decodeProgressive(audioContext, header, stream, abortController);
+                return this._decodeProgressive(audioContext, header, stream, abortController, maxDuration);
             }
         }
 
-        return this._decodeFull(await stream.readAll());
+        return this._decodeFull(await stream.readAll(), maxDuration);
     }
 
-    private async _decodeFull(bytes: Uint8Array): Promise<TrackAudio> {
+    /** Audio past `maxDuration` (the STREAMINFO length) is cut, as in the progressive path. */
+    private async _decodeFull(bytes: Uint8Array, maxDuration = Infinity): Promise<TrackAudio> {
         if (!this._audioContext) {
             throw new Error('AudioContext was closed before decode completed');
         }
@@ -1282,14 +1292,15 @@ class WebAudioGaplessPlayer {
         const buffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
             ? bytes.buffer as ArrayBuffer
             : bytes.slice().buffer;
-        return TrackAudio.fromBuffer(await this._audioContext.decodeAudioData(stripLeadingId3(buffer)));
+        return TrackAudio.fromBuffer(await this._audioContext.decodeAudioData(stripLeadingId3(buffer)), maxDuration);
     }
 
     private async _decodeProgressive(
         audioContext: AudioContext,
         header: FlacHeader,
         stream: ByteStream,
-        abortController: AbortController
+        abortController: AbortController,
+        maxDuration: number
     ): Promise<TrackAudio> {
         const chunker = new FlacChunker(header);
         let track: TrackAudio;
@@ -1317,7 +1328,7 @@ class WebAudioGaplessPlayer {
             }
             // Nothing plays yet: decode the whole file the regular way.
             console.warn(`${LOG_PREFIX} progressive FLAC decode failed; decoding the full file`, err);
-            return this._decodeFull(await stream.readAll());
+            return this._decodeFull(await stream.readAll(), maxDuration);
         }
 
         stream.release();
@@ -1334,33 +1345,30 @@ class WebAudioGaplessPlayer {
         decodedSamples: number
     ): Promise<void> {
         try {
-            for (;;) {
-                let chunk = chunker.take(CHUNK_BYTES, stream.done);
-                while (chunk) {
+            while (decodedSamples < header.totalSamples) {
+                const chunk = chunker.take(CHUNK_BYTES, stream.done);
+                if (chunk) {
                     // Audio past the STREAMINFO length is cut: the next track
                     // is scheduled at the declared end.
                     const playable = Math.min(chunk.samples, header.totalSamples - decodedSamples);
-                    if (playable > 0) {
-                        track.append(await decodeChunk(audioContext, chunk), playable);
-                    }
+                    track.append(await decodeChunk(audioContext, chunk), playable);
                     decodedSamples += chunk.samples;
-                    chunk = chunker.take(CHUNK_BYTES, stream.done);
-                }
-                if (stream.done) {
-                    break;
-                }
-                const part = await stream.read();
-                if (part) {
-                    chunker.push(part);
+                } else if (stream.done) {
+                    // Truncated download: fail like a broken connection, so the
+                    // stall at its end hands off instead of playing silence.
+                    throw new Error(`FLAC stream ended after ${decodedSamples} of ${header.totalSamples} samples`);
+                } else {
+                    const part = await stream.read();
+                    if (part) {
+                        chunker.push(part);
+                    }
                 }
             }
-            if (decodedSamples < header.totalSamples) {
-                // Truncated download: fail like a broken connection, so the
-                // stall at its end hands off instead of playing silence.
-                throw new Error(`FLAC stream ended after ${decodedSamples} of ${header.totalSamples} samples`);
+            if (!stream.done) {
+                stream.cancel();
             }
             if (decodedSamples > header.totalSamples) {
-                console.warn(`${LOG_PREFIX} FLAC stream has ${decodedSamples} samples, STREAMINFO says ${header.totalSamples}`);
+                console.warn(`${LOG_PREFIX} FLAC stream is longer than its STREAMINFO total of ${header.totalSamples} samples; the rest is cut`);
             }
             track.finish();
         } catch (err) {

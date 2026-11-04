@@ -506,10 +506,11 @@
       this._decodedFrames = 0;
       this._listeners = /* @__PURE__ */ new Set();
     }
-    static fromBuffer(buffer) {
-      const track = new _TrackAudio(buffer.duration);
-      track.chunks.push({ startTime: 0, buffer, duration: buffer.duration });
-      track._decodedDuration = buffer.duration;
+    static fromBuffer(buffer, maxDuration = Infinity) {
+      const duration = Math.min(buffer.duration, snapToFrame(maxDuration, buffer.sampleRate));
+      const track = new _TrackAudio(duration);
+      track.chunks.push({ startTime: 0, buffer, duration });
+      track._decodedDuration = duration;
       track.finish();
       return track;
     }
@@ -798,6 +799,10 @@
       while (await this.read()) {
       }
       return this.bytes();
+    }
+    cancel() {
+      this.done = true;
+      this._reader.cancel().catch(() => void 0);
     }
     release() {
       this._retain = false;
@@ -1564,27 +1569,32 @@
       if (probe.kind === "more") {
         probe = probeFlac(stream.bytes());
       }
+      let maxDuration = Infinity;
       if (probe.kind === "flac") {
         const { header } = probe;
+        if (header.totalSamples > 0) {
+          maxDuration = header.totalSamples / header.sampleRate;
+        }
         if (this._audioContext && header.sampleRate !== this._audioContext.sampleRate && this._canSwitchContextRate(index)) {
           await this._switchContextRate(header.sampleRate, index, abortController.signal);
           abortController.signal.throwIfAborted();
         }
         const audioContext = this._audioContext;
         if (audioContext && header.sampleRate === audioContext.sampleRate && header.totalSamples > 0) {
-          return this._decodeProgressive(audioContext, header, stream, abortController);
+          return this._decodeProgressive(audioContext, header, stream, abortController, maxDuration);
         }
       }
-      return this._decodeFull(await stream.readAll());
+      return this._decodeFull(await stream.readAll(), maxDuration);
     }
-    async _decodeFull(bytes) {
+    /** Audio past `maxDuration` (the STREAMINFO length) is cut, as in the progressive path. */
+    async _decodeFull(bytes, maxDuration = Infinity) {
       if (!this._audioContext) {
         throw new Error("AudioContext was closed before decode completed");
       }
       const buffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice().buffer;
-      return TrackAudio.fromBuffer(await this._audioContext.decodeAudioData(stripLeadingId3(buffer)));
+      return TrackAudio.fromBuffer(await this._audioContext.decodeAudioData(stripLeadingId3(buffer)), maxDuration);
     }
-    async _decodeProgressive(audioContext, header, stream, abortController) {
+    async _decodeProgressive(audioContext, header, stream, abortController, maxDuration) {
       const chunker = new FlacChunker(header);
       let track;
       let first;
@@ -1610,7 +1620,7 @@
           throw err;
         }
         console.warn(`${LOG_PREFIX3} progressive FLAC decode failed; decoding the full file`, err);
-        return this._decodeFull(await stream.readAll());
+        return this._decodeFull(await stream.readAll(), maxDuration);
       }
       stream.release();
       void this._continueProgressive(audioContext, header, chunker, stream, track, first.samples);
@@ -1618,29 +1628,26 @@
     }
     async _continueProgressive(audioContext, header, chunker, stream, track, decodedSamples) {
       try {
-        for (; ; ) {
-          let chunk = chunker.take(CHUNK_BYTES, stream.done);
-          while (chunk) {
+        while (decodedSamples < header.totalSamples) {
+          const chunk = chunker.take(CHUNK_BYTES, stream.done);
+          if (chunk) {
             const playable = Math.min(chunk.samples, header.totalSamples - decodedSamples);
-            if (playable > 0) {
-              track.append(await decodeChunk(audioContext, chunk), playable);
-            }
+            track.append(await decodeChunk(audioContext, chunk), playable);
             decodedSamples += chunk.samples;
-            chunk = chunker.take(CHUNK_BYTES, stream.done);
-          }
-          if (stream.done) {
-            break;
-          }
-          const part = await stream.read();
-          if (part) {
-            chunker.push(part);
+          } else if (stream.done) {
+            throw new Error(`FLAC stream ended after ${decodedSamples} of ${header.totalSamples} samples`);
+          } else {
+            const part = await stream.read();
+            if (part) {
+              chunker.push(part);
+            }
           }
         }
-        if (decodedSamples < header.totalSamples) {
-          throw new Error(`FLAC stream ended after ${decodedSamples} of ${header.totalSamples} samples`);
+        if (!stream.done) {
+          stream.cancel();
         }
         if (decodedSamples > header.totalSamples) {
-          console.warn(`${LOG_PREFIX3} FLAC stream has ${decodedSamples} samples, STREAMINFO says ${header.totalSamples}`);
+          console.warn(`${LOG_PREFIX3} FLAC stream is longer than its STREAMINFO total of ${header.totalSamples} samples; the rest is cut`);
         }
         track.finish();
       } catch (err) {

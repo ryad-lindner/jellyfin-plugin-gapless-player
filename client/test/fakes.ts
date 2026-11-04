@@ -169,6 +169,8 @@ export function throttle(id: string, bytes: number): { send(more?: number): void
 export const fetches: string[] = [];
 /** Track ids whose FLAC download was aborted mid-stream. */
 export const aborts: string[] = [];
+/** Track ids whose FLAC download the player cancelled after reading enough. */
+export const cancels: string[] = [];
 
 /** The encoded bytes of a flacTrack(). */
 export function flacBytes(id: string): Uint8Array {
@@ -272,6 +274,9 @@ function flacBody(id: string, bytes: Uint8Array, signal?: AbortSignal): Readable
             const end = Math.min(bytes.length, sent + STREAM_PART_BYTES, state.limit);
             controller.enqueue(bytes.slice(sent, end));
             sent = end;
+        },
+        cancel() {
+            cancels.push(id);
         }
     });
 }
@@ -511,6 +516,7 @@ export function createHarness(): Harness {
     throttles.clear();
     fetches.length = 0;
     aborts.length = 0;
+    cancels.length = 0;
     fetchGates.clear();
     decodeGates.clear();
 

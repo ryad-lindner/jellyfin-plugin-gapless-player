@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { afterEach, test } from 'node:test';
-import { FakeAudioContext, type FakeSource, START_LEAD_SEC, aborts, createHarness, disposeAll, fetches, flacTrack, flush, holdFetch, throttle, track } from './fakes';
+import { FakeAudioContext, type FakeSource, START_LEAD_SEC, aborts, cancels, createHarness, disposeAll, fetches, flacTrack, flush, holdFetch, throttle, track } from './fakes';
 
 const TICKS_PER_MS = 10_000;
 // Enough for the first chunk (256 KB) of a fake FLAC track, about 21 s of audio.
@@ -313,6 +313,71 @@ test('a stream longer than its STREAMINFO total is cut where the next item start
     const [b] = h.ctx().live('B');
     assert.ok(Math.abs(chunks.at(-1)!.endsAt - (chunks[0].startedAt! + 30)) < 1e-9, 'A ends at the declared length');
     assert.ok(Math.abs(b.startedAt! - chunks.at(-1)!.endsAt) < 1e-9);
+    await h.ctx().advance(30.5);
+    assert.deepEqual(h.ctx().audible(), ['B']);
+    assert.deepEqual(h.handoffs, []);
+});
+
+test('the download stops once the STREAMINFO total is decoded', async () => {
+    const h = createHarness();
+    await playAlbum(h, [flacTrack('A', 120, { declaredSec: 30 }), track('B', 90)]);
+
+    assert.deepEqual(cancels, ['A']);
+    assert.deepEqual(aborts, []);
+    assert.deepEqual(fetches, ['A', 'B'], 'the preload of B does not wait for the rest of A');
+    const chunks = sourcesOf(h, 'A');
+    assert.ok(Math.abs(chunks.at(-1)!.endsAt - (chunks[0].startedAt! + 30)) < 1e-9);
+    await h.ctx().advance(30.5);
+    assert.deepEqual(h.ctx().audible(), ['B']);
+    assert.deepEqual(h.handoffs, []);
+});
+
+test('a track that reaches its STREAMINFO total in the first chunk stops its download', async () => {
+    const h = createHarness();
+    await playAlbum(h, [flacTrack('A', 60, { declaredSec: 10 }), track('B', 90)]);
+
+    assert.deepEqual(cancels, ['A']);
+    assert.deepEqual(aborts, []);
+    const [a] = sourcesOf(h, 'A');
+    const [b] = h.ctx().live('B');
+    assert.ok(Math.abs(a.endsAt - (a.startedAt! + 10)) < 1e-9, 'A ends at the declared length');
+    assert.ok(Math.abs(b.startedAt! - a.endsAt) < 1e-9);
+});
+
+test('a FLAC at another rate than the context is cut at the STREAMINFO total', async () => {
+    const h = createHarness();
+    await playAlbum(h, [track('A', 10), flacTrack('B', 31, { sampleRate: 44_100, declaredSec: 30 }), track('C', 90)]);
+    await h.ctx().advance(11);
+    await flush();
+
+    const [b] = sourcesOf(h, 'B');
+    const [c] = h.ctx().live('C');
+    assert.equal(sourcesOf(h, 'B').length, 1, 'full-file decode');
+    assert.ok(Math.abs(b.endsAt - (b.startedAt! + 30)) < 1e-9, 'B ends at the declared length');
+    assert.ok(Math.abs(c.startedAt! - b.endsAt) < 1e-9);
+});
+
+test('a FLAC without a STREAMINFO total plays its whole full-file decode', async () => {
+    const h = createHarness();
+    await playAlbum(h, [track('A', 10), flacTrack('B', 31, { sampleRate: 44_100, declaredSec: 0 }), track('C', 90)]);
+    await h.ctx().advance(11);
+    await flush();
+
+    const [b] = sourcesOf(h, 'B');
+    const [c] = h.ctx().live('C');
+    assert.ok(Math.abs(b.endsAt - (b.startedAt! + 31)) < 1e-9, 'B plays its whole length');
+    assert.ok(Math.abs(c.startedAt! - b.endsAt) < 1e-9);
+});
+
+test('the full-file fallback is cut at the STREAMINFO total as well', async () => {
+    const h = createHarness();
+    await playAlbum(h, [flacTrack('A', 31, { declaredSec: 30, padSamples: 1 }), track('B', 90)]);
+
+    const [a] = sourcesOf(h, 'A');
+    const [b] = h.ctx().live('B');
+    assert.equal(sourcesOf(h, 'A').length, 1, 'full-file decode');
+    assert.ok(Math.abs(a.endsAt - (a.startedAt! + 30)) < 1e-9, 'A ends at the declared length');
+    assert.ok(Math.abs(b.startedAt! - a.endsAt) < 1e-9);
     await h.ctx().advance(30.5);
     assert.deepEqual(h.ctx().audible(), ['B']);
     assert.deepEqual(h.handoffs, []);
