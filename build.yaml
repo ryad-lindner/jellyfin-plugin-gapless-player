@@ -1,7 +1,7 @@
 ---
 name: "Gapless Player"
 guid: "399b650e-cca7-4f06-95a1-6b55f6fededc"
-version: "0.1.0.9"
+version: "0.1.0.10"
 targetAbi: "12.4.0.0"
 framework: "net10.0"
 overview: "Gapless Web Audio playback for eligible audio queues."
@@ -16,8 +16,8 @@ owner: "ryad-lindner"
 artifacts:
 - "Jellyfin.Plugin.GaplessPlayer.dll"
 changelog: >
-  FLAC tracks start playing after their first ~256 KB instead of after the
-  full download. If the download falls behind playback, playback pauses at that
-  point and continues once more has arrived. Other formats are unchanged.
-  Requires Jellyfin 12.4 or later; 12.3 servers keep 0.1.0.8.
+  FLAC downloads stop once a track's declared length is decoded instead of
+  fetching audio that is never played, and FLAC tracks that are decoded as a
+  whole file are cut at their declared length as well. Requires Jellyfin 12.4
+  or later.
 ---
