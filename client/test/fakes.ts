@@ -3,6 +3,7 @@
  * manual clock, gated fetches and decodes, and an events/playbackManager pair
  * that mirrors stock jellyfin-web's handling of a self-managed player.
  */
+import { FlacChunker, probeFlac } from '../src/flac';
 import WebAudioGaplessPlayer from '../src/plugin';
 
 export interface TestItem {
@@ -19,9 +20,20 @@ export interface TestItem {
 interface Track {
     durationSec: number;
     undecodable: boolean;
+    flac?: FlacTrack;
+}
+
+interface FlacTrack {
+    bytes: Uint8Array;
+    sampleRate: number;
+    /** Extra samples the fake decoder adds to every chunk (a padding decoder). */
+    padSamples: number;
 }
 
 const tracks = new Map<string, Track>();
+// FLAC tracks carry their number in STREAMINFO's minimum frame size, which
+// chunk files keep, so the fake decoder knows which track a chunk belongs to.
+const flacIds: string[] = [];
 
 export function track(id: string, durationSec: number, { undecodable = false } = {}): TestItem {
     tracks.set(id, { durationSec, undecodable });
@@ -33,6 +45,138 @@ export function track(id: string, durationSec: number, { undecodable = false } =
         Url: `https://jf.test/Audio/${id}/stream`,
         ServerId: 'server'
     };
+}
+
+function crc8(bytes: number[]): number {
+    let crc = 0;
+    for (const byte of bytes) {
+        crc ^= byte;
+        for (let bit = 0; bit < 8; bit++) {
+            crc = crc & 0x80 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+        }
+    }
+    return crc;
+}
+
+/** FLAC's UTF-8-style number coding: 1 byte up to 7 bits, then 5 * length + 1 bits. */
+function codedNumber(n: number): number[] {
+    if (n < 0x80) {
+        return [n];
+    }
+    let length = 2;
+    while (n >= 2 ** (5 * length + 1)) {
+        length++;
+    }
+    const bytes: number[] = [];
+    for (let i = 1; i < length; i++) {
+        bytes.unshift(0x80 | (n & 0x3f));
+        n = Math.floor(n / 64);
+    }
+    bytes.unshift(((0xff00 >> length) & 0xff) | n);
+    return bytes;
+}
+
+/**
+ * A FLAC stream of fake frames: valid frame headers (CRC-8, frame numbers),
+ * payload bytes that never form a sync code. Only the fake decoder reads it.
+ */
+export function flacTrack(id: string, durationSec: number, {
+    sampleRate = 48_000,
+    blockSize = 4096,
+    frameBytes = 1024,
+    padSamples = 0,
+    variableBlocks = false,
+    // STREAMINFO's total when it should differ from the frames actually sent.
+    declaredSec = durationSec,
+    pictureBytes = 0
+} = {}): TestItem {
+    const item = track(id, durationSec);
+    const totalSamples = Math.round(durationSec * sampleRate);
+    const declaredSamples = Math.round(declaredSec * sampleRate);
+    flacIds.push(id);
+    const tag = flacIds.length;
+
+    const streamInfo = new Uint8Array(34);
+    streamInfo.set([blockSize >> 8, blockSize & 0xff, blockSize >> 8, blockSize & 0xff]);
+    streamInfo.set([(tag >> 16) & 0xff, (tag >> 8) & 0xff, tag & 0xff], 4);
+    // 20-bit rate, 3-bit channels - 1 (stereo), 5-bit bits - 1 (16), 36-bit total.
+    streamInfo[10] = (sampleRate >> 12) & 0xff;
+    streamInfo[11] = (sampleRate >> 4) & 0xff;
+    streamInfo[12] = ((sampleRate & 0x0f) << 4) | (1 << 1);
+    streamInfo[13] = (15 << 4) | Math.floor(declaredSamples / 2 ** 32);
+    streamInfo[14] = (declaredSamples >>> 24) & 0xff;
+    streamInfo[15] = (declaredSamples >>> 16) & 0xff;
+    streamInfo[16] = (declaredSamples >>> 8) & 0xff;
+    streamInfo[17] = declaredSamples & 0xff;
+
+    const parts: number[] = [0x66, 0x4c, 0x61, 0x43, pictureBytes ? 0 : 0x80, 0, 0, 34, ...streamInfo];
+    if (pictureBytes) {
+        // A PICTURE block (type 6) as the last metadata block.
+        parts.push(0x86, (pictureBytes >> 16) & 0xff, (pictureBytes >> 8) & 0xff, pictureBytes & 0xff);
+        for (let i = 0; i < pictureBytes; i++) {
+            parts.push(0x11);
+        }
+    }
+    const payload = new Array<number>(frameBytes).fill(0x5a);
+    for (let frame = 0, sample = 0; sample < totalSamples; frame++, sample += blockSize) {
+        const size = Math.min(blockSize, totalSamples - sample);
+        // Block size code 7: 16-bit size - 1 after the frame (or, with
+        // variable blocks, sample) number.
+        const number = variableBlocks ? sample : frame;
+        const header = [0xff, variableBlocks ? 0xf9 : 0xf8, 0x70, 0x10, ...codedNumber(number), (size - 1) >> 8, (size - 1) & 0xff];
+        parts.push(...header, crc8(header), ...payload);
+    }
+
+    tracks.set(id, { durationSec, undecodable: false, flac: { bytes: Uint8Array.from(parts), sampleRate, padSamples } });
+    return item;
+}
+
+const STREAM_PART_BYTES = 64 * 1024;
+
+interface Throttle {
+    limit: number;
+    failed: boolean;
+    wake: (() => void) | null;
+}
+
+const throttles = new Map<string, Throttle>();
+
+/**
+ * Delivers only the first `bytes` of a FLAC track's download until send()
+ * releases more; fail() breaks the connection.
+ */
+export function throttle(id: string, bytes: number): { send(more?: number): void; fail(): void } {
+    const state: Throttle = { limit: bytes, failed: false, wake: null };
+    throttles.set(id, state);
+    const wake = (): void => {
+        const resolve = state.wake;
+        state.wake = null;
+        resolve?.();
+    };
+    return {
+        send(more = Infinity) {
+            state.limit += more;
+            wake();
+        },
+        fail() {
+            state.failed = true;
+            wake();
+        }
+    };
+}
+
+/** Track ids in the order their downloads started. */
+export const fetches: string[] = [];
+/** Track ids whose FLAC download was aborted mid-stream. */
+export const aborts: string[] = [];
+
+/** The encoded bytes of a flacTrack(). */
+export function flacBytes(id: string): Uint8Array {
+    const flac = tracks.get(id)?.flac;
+    if (!flac) {
+        throw new Error(`${id} is not a FLAC track`);
+    }
+    return flac.bytes;
 }
 
 /** Lets pending promise chains (fetch, decode, start) run to completion. */
@@ -84,8 +228,52 @@ async function fakeFetch(url: string, init?: { signal?: AbortSignal }): Promise<
     if (init?.signal?.aborted) {
         throw abortError();
     }
+    fetches.push(id);
+    const flac = tracks.get(id)?.flac;
+    if (flac) {
+        return new Response(flacBody(id, flac.bytes, init?.signal), {
+            headers: { 'Content-Length': String(flac.bytes.byteLength) }
+        });
+    }
     const body = new TextEncoder().encode(id);
     return new Response(body, { headers: { 'Content-Length': String(body.byteLength) } });
+}
+
+function flacBody(id: string, bytes: Uint8Array, signal?: AbortSignal): ReadableStream<Uint8Array> {
+    const state = throttles.get(id) ?? { limit: Infinity, failed: false, wake: null };
+    let sent = 0;
+    let aborted = false;
+    return new ReadableStream<Uint8Array>({
+        start(controller) {
+            signal?.addEventListener('abort', () => {
+                aborted = true;
+                aborts.push(id);
+                controller.error(abortError());
+                state.wake?.();
+            });
+        },
+        async pull(controller) {
+            while (sent < bytes.length && sent >= state.limit && !state.failed && !aborted) {
+                await new Promise<void>(resolve => {
+                    state.wake = resolve;
+                });
+            }
+            if (aborted) {
+                return;
+            }
+            if (state.failed) {
+                controller.error(new TypeError('network error'));
+                return;
+            }
+            if (sent >= bytes.length) {
+                controller.close();
+                return;
+            }
+            const end = Math.min(bytes.length, sent + STREAM_PART_BYTES, state.limit);
+            controller.enqueue(bytes.slice(sent, end));
+            sent = end;
+        }
+    });
 }
 
 /** The player schedules every start this far ahead of currentTime. */
@@ -94,19 +282,28 @@ export const START_LEAD_SEC = 0.05;
 /** Web Audio delivers 'ended' after the render quantum that played the last frame. */
 const ENDED_DELAY_SEC = 128 / 48_000;
 
+export interface FakeBuffer {
+    duration: number;
+    id: string;
+    length?: number;
+    sampleRate?: number;
+}
+
 export class FakeSource {
-    buffer: { duration: number; id: string } | null = null;
+    buffer: FakeBuffer | null = null;
     onended: (() => void) | null = null;
     startedAt: number | null = null;
     offset = 0;
+    duration: number | null = null;
     stopped = false;
     ended = false;
 
     connect(): void {}
 
-    start(when = 0, offset = 0): void {
+    start(when = 0, offset = 0, duration?: number): void {
         this.startedAt = when;
         this.offset = offset;
+        this.duration = duration ?? null;
     }
 
     stop(): void {
@@ -119,7 +316,7 @@ export class FakeSource {
     }
 
     get endsAt(): number {
-        return (this.startedAt ?? 0) + (this.buffer?.duration ?? 0) - this.offset;
+        return (this.startedAt ?? 0) + (this.duration ?? (this.buffer?.duration ?? 0) - this.offset);
     }
 
     get playing(): boolean {
@@ -129,13 +326,24 @@ export class FakeSource {
 
 export class FakeAudioContext {
     static instances: FakeAudioContext[] = [];
+    /** The device rate a context gets without (or ignoring) a sampleRate option. */
+    static defaultSampleRate = 48_000;
+    /** False: like a browser that ignores the sampleRate option. */
+    static honorsSampleRate = true;
+    /** True: a context created with a sampleRate stays suspended (no user gesture). */
+    static rateContextsStaySuspended = false;
     currentTime = 0;
     state = 'running';
     destination = {};
     sources: FakeSource[] = [];
+    readonly sampleRate: number;
 
-    constructor() {
+    constructor(options?: { sampleRate?: number }) {
+        this.sampleRate = (FakeAudioContext.honorsSampleRate && options?.sampleRate) || FakeAudioContext.defaultSampleRate;
         FakeAudioContext.instances.push(this);
+        if (options?.sampleRate && FakeAudioContext.rateContextsStaySuspended) {
+            this.suspendUntilReleased();
+        }
     }
 
     createGain(): { gain: { value: number }; connect(): void } {
@@ -148,7 +356,22 @@ export class FakeAudioContext {
         return source;
     }
 
-    async decodeAudioData(data: ArrayBuffer): Promise<{ duration: number; id: string }> {
+    async decodeAudioData(data: ArrayBuffer): Promise<FakeBuffer> {
+        const bytes = new Uint8Array(data);
+        const probe = probeFlac(bytes);
+        if (probe.kind === 'flac') {
+            const info = probe.header.streamInfo;
+            const id = flacIds[((info[4] << 16) | (info[5] << 8) | info[6]) - 1];
+            await decodeGates.get(id);
+            const flac = tracks.get(id)?.flac;
+            if (!flac) {
+                throw new Error('Unable to decode audio data');
+            }
+            const chunker = new FlacChunker(probe.header);
+            chunker.push(bytes.subarray(probe.header.firstFrame));
+            const length = (chunker.take(0, true)?.samples ?? 0) + flac.padSamples;
+            return { duration: length / flac.sampleRate, id, length, sampleRate: flac.sampleRate };
+        }
         const id = new TextDecoder().decode(data);
         await decodeGates.get(id);
         const info = tracks.get(id);
@@ -159,6 +382,8 @@ export class FakeAudioContext {
     }
 
     private resumeGate: Promise<void> | null = null;
+    /** Releases the latest suspendUntilReleased(). */
+    releaseResume: (() => void) | null = null;
 
     /** Suspends the context; resume() then waits until release() (e.g. a mobile background interruption). */
     suspendUntilReleased(state: 'suspended' | 'interrupted' = 'suspended'): () => void {
@@ -173,6 +398,7 @@ export class FakeAudioContext {
             };
         });
         this.resumeGate = resumeGate;
+        this.releaseResume = release;
         return release;
     }
 
@@ -181,11 +407,16 @@ export class FakeAudioContext {
             throw new DOMException('Cannot resume a closed AudioContext', 'InvalidStateError');
         }
         await this.resumeGate;
+        if (this.state === 'closed') {
+            // Like browsers, a resume pending while the context closes rejects.
+            throw new DOMException('The AudioContext was closed', 'InvalidStateError');
+        }
         this.state = 'running';
     }
 
     close(): Promise<void> {
         this.state = 'closed';
+        this.releaseResume?.();
         return Promise.resolve();
     }
 
@@ -272,7 +503,14 @@ export function disposeAll(): void {
 export function createHarness(): Harness {
     installGlobals();
     FakeAudioContext.instances = [];
+    FakeAudioContext.defaultSampleRate = 48_000;
+    FakeAudioContext.honorsSampleRate = true;
+    FakeAudioContext.rateContextsStaySuspended = false;
     tracks.clear();
+    flacIds.length = 0;
+    throttles.clear();
+    fetches.length = 0;
+    aborts.length = 0;
     fetchGates.clear();
     decodeGates.clear();
 
@@ -355,7 +593,9 @@ export function createHarness(): Harness {
         handoffs,
         destroyed: () => destroyed,
         ctx: () => {
-            const ctx = FakeAudioContext.instances.at(-1);
+            // A context the player tried and discarded is closed; skip it.
+            const ctx = FakeAudioContext.instances.filter(c => c.state !== 'closed').at(-1)
+                ?? FakeAudioContext.instances.at(-1);
             if (!ctx) {
                 throw new Error('no AudioContext created');
             }

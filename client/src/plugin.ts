@@ -1,7 +1,9 @@
 import type { AppHostApi, AppSettingsApi, EventsApi, PlaybackManagerApi, PluginDeps } from './deps';
+import { FlacChunker, type FlacChunk, type FlacHeader, id3TagLength, probeFlac } from './flac';
 import { initNotifications } from './notifications';
 import { getServerConfig } from './serverConfig';
 import { setToggleDeps } from './toggle';
+import { TrackAudio, TrackVoice, snapToFrame } from './trackAudio';
 
 const TICKS_PER_MS = 10000;
 const VOLUME_EXPONENT = 3;
@@ -10,6 +12,15 @@ const TIMEUPDATE_INTERVAL_MS = 1000;
 // timeupdate to 700ms anyway, so finer granularity would be wasted.
 const DOWNLOAD_PROGRESS_EVENT_MS = 500;
 const BLOCKING_LOOKAHEAD_THRESHOLD_MS = 30000;
+// Progressive FLAC: a small first chunk starts playback early, larger ones
+// keep the decode calls few.
+const FIRST_CHUNK_BYTES = 256 * 1024;
+const CHUNK_BYTES = 1024 * 1024;
+// How long a new AudioContext at the track's sample rate may take to start
+// before the queue keeps the existing one.
+const CONTEXT_SWITCH_TIMEOUT_MS = 300;
+// Audio that must be decoded past a progressive start position before it starts.
+const START_MARGIN_SEC = 0.001;
 const LOG_PREFIX = '[GaplessPlayer]';
 
 const SETTING_ENABLED = 'enableWebAudioGapless';
@@ -146,20 +157,22 @@ function randomInt(min: number, max: number): number {
  * Audio does not. Returns the original buffer when there is no ID3 header.
  */
 function stripLeadingId3(buffer: ArrayBuffer): ArrayBuffer {
-    const bytes = new Uint8Array(buffer);
-    // "ID3"
-    if (bytes.length < 10 || bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) {
-        return buffer;
+    const start = id3TagLength(new Uint8Array(buffer)) ?? 0;
+    return start > 0 && start < buffer.byteLength ? buffer.slice(start) : buffer;
+}
+
+function concatBytes(parts: Uint8Array[], length: number): Uint8Array {
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const part of parts) {
+        bytes.set(part, offset);
+        offset += part.byteLength;
     }
+    return bytes;
+}
 
-    // Syncsafe 28-bit size (7 bits per byte), plus the 10-byte header, plus a
-    // 10-byte footer when the footer flag (bit 4 of the flags byte) is set.
-    const size = ((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14)
-        | ((bytes[8] & 0x7f) << 7) | (bytes[9] & 0x7f);
-    const hasFooter = (bytes[5] & 0x10) !== 0;
-    const start = 10 + size + (hasFooter ? 10 : 0);
-
-    return start < bytes.length ? buffer.slice(start) : buffer;
+function delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
@@ -169,6 +182,73 @@ function stripLeadingId3(buffer: ArrayBuffer): ArrayBuffer {
  */
 function getIncludeCorsCredentials(): boolean {
     return (window as unknown as { __gaplessCors?: boolean }).__gaplessCors === true;
+}
+
+/**
+ * Decodes one progressive FLAC chunk. A decoder that adds or drops samples
+ * (e.g. padding) would put clicks at every join, so the decoded length must
+ * match the frame headers exactly.
+ */
+async function decodeChunk(audioContext: BaseAudioContext, chunk: FlacChunk): Promise<AudioBuffer> {
+    const buffer = await audioContext.decodeAudioData(chunk.file);
+    if (buffer.length !== chunk.samples) {
+        throw new Error(`FLAC chunk decoded to ${buffer.length} samples, expected ${chunk.samples}`);
+    }
+    return buffer;
+}
+
+/** A response body read part by part, keeping the parts until release(). */
+class ByteStream {
+    loaded = 0;
+    done = false;
+    private _parts: Uint8Array[] = [];
+    private _retainedLength = 0;
+    private _retain = true;
+
+    constructor(
+        private readonly _reader: ReadableStreamDefaultReader<Uint8Array>,
+        private readonly _total: number,
+        private readonly _onProgress?: (loaded: number, total: number) => void
+    ) {}
+
+    /** The next part, or null at the end of the stream. */
+    async read(): Promise<Uint8Array | null> {
+        const { done, value } = await this._reader.read();
+        if (done) {
+            this.done = true;
+            return null;
+        }
+        if (this._retain) {
+            this._parts.push(value);
+            this._retainedLength += value.byteLength;
+        }
+        this.loaded += value.byteLength;
+        if (this._total > 0) {
+            this._onProgress?.(this.loaded, this._total);
+        }
+        return value;
+    }
+
+    /** Everything read so far; only valid before release(). */
+    bytes(): Uint8Array {
+        if (this._parts.length !== 1) {
+            this._parts = [concatBytes(this._parts, this._retainedLength)];
+        }
+        return this._parts[0] ?? new Uint8Array(0);
+    }
+
+    async readAll(): Promise<Uint8Array> {
+        while (await this.read()) {
+            // Reading retains the parts.
+        }
+        return this.bytes();
+    }
+
+    release(): void {
+        this._retain = false;
+        this._parts = [];
+        this._retainedLength = 0;
+    }
 }
 
 class WebAudioGaplessPlayer {
@@ -188,9 +268,10 @@ class WebAudioGaplessPlayer {
     private _playlist: GaplessItem[] = [];
     private _sortedPlaylist: GaplessItem[] = [];
     private _currentIndex = 0;
-    private _decoded = new Map<number, AudioBuffer>();
-    private _decoding = new Map<number, Promise<AudioBuffer>>();
+    private _decoded = new Map<number, TrackAudio>();
+    private _decoding = new Map<number, Promise<TrackAudio>>();
     private _decodeAborts = new Map<number, AbortController>();
+    private _preloadWaiters = new WeakSet<TrackAudio>();
     private _downloadProgress = new Map<number, { loaded: number; total: number }>();
     // Item for which an optimistic itemstarted was fired (so the now-playing
     // bar appears and paints download progress) but audio has not started yet.
@@ -206,7 +287,7 @@ class WebAudioGaplessPlayer {
     // its target. With a running context this window is one microtask.
     private _pendingStart: PendingStart | null = null;
     private _lastProgressTriggerMs = 0;
-    private _scheduled = new Map<number, AudioBufferSourceNode>();
+    private _scheduled = new Map<number, TrackVoice>();
     private _scheduledStartTimes = new Map<number, number>();
     private _schedule = new Map<number, ScheduleEntry>();
     private _volume = 100;
@@ -536,8 +617,10 @@ class WebAudioGaplessPlayer {
             return [];
         }
 
-        if (this._decoded.has(this._currentIndex)) {
-            return [{ start: 0, end: runTimeTicks }];
+        const track = this._decoded.get(this._currentIndex);
+        if (track) {
+            const fraction = track.complete ? 1 : Math.min(1, track.decodedDuration / track.duration);
+            return [{ start: 0, end: Math.floor(runTimeTicks * fraction) }];
         }
 
         // Byte fraction as a stand-in for the time fraction (inexact for VBR,
@@ -889,12 +972,13 @@ class WebAudioGaplessPlayer {
         this._scheduled.clear();
         this._scheduledStartTimes.clear();
         this._schedule.clear();
-        this._clearDecodedAfterMutation();
+        this._clearDecodedAfterMutation(currentBuffer);
 
         const newCurrentIndex = this._currentIndex;
         if (currentSource) {
             const playbackId = this._playbackId;
             currentSource.onended = () => this._onSourceEnded(newCurrentIndex, playbackId);
+            currentSource.onstalled = (positionSec) => this._onVoiceStalled(newCurrentIndex, playbackId, positionSec);
             this._scheduled.set(newCurrentIndex, currentSource);
         }
         if (currentStartTime != null) {
@@ -971,10 +1055,85 @@ class WebAudioGaplessPlayer {
         }
 
         // iOS Safari reports 'interrupted' during an audio-session interruption.
-        const state: string = this._audioContext.state;
+        const audioContext = this._audioContext;
+        const state: string = audioContext.state;
         if (state === 'suspended' || state === 'interrupted') {
-            await this._audioContext.resume();
+            try {
+                await audioContext.resume();
+            } catch (err) {
+                // The initial load moved the queue to a new context and closed
+                // this one while it resumed: continue on the new one.
+                if (this._audioContext && this._audioContext !== audioContext) {
+                    return this._ensureAudioGraph();
+                }
+                throw err;
+            }
         }
+    }
+
+    /**
+     * Moves a queue that has not started yet onto an AudioContext running at
+     * the first track's sample rate, so progressive FLAC decodes need no
+     * resampling and the system resamples the output as one stream. Keeps the
+     * current context when the browser ignores the rate or will not start the
+     * new context without a user gesture.
+     */
+    private async _switchContextRate(sampleRate: number, index: number, signal: AbortSignal): Promise<void> {
+        const current = this._audioContext;
+        const AudioContextCtor = getAudioContextConstructor();
+        if (!current || !AudioContextCtor) {
+            return;
+        }
+
+        let next: AudioContext;
+        try {
+            next = new AudioContextCtor({ sampleRate });
+        } catch {
+            return;
+        }
+        const discard = (): void => {
+            next.close().catch(() => {});
+        };
+        if (next.sampleRate !== sampleRate) {
+            discard();
+            return;
+        }
+        if (next.state !== 'running') {
+            const started = await Promise.race([
+                next.resume().then(() => true, () => false),
+                delay(CONTEXT_SWITCH_TIMEOUT_MS).then(() => false)
+            ]);
+            if (!started || (next.state as AudioContextState) !== 'running') {
+                discard();
+                return;
+            }
+        }
+        if (this._audioContext !== current || signal.aborted || !this._canSwitchContextRate(index)) {
+            discard();
+            return;
+        }
+
+        this.debugLog('switched AudioContext sample rate', { from: current.sampleRate, to: sampleRate });
+        this._audioContext = next;
+        this._gainNode = next.createGain();
+        this._gainNode.connect(next.destination);
+        this._applyVolume();
+        current.close().catch((err) => {
+            console.warn(`${LOG_PREFIX} failed to close AudioContext`, err);
+        });
+    }
+
+    /**
+     * Only the initial load of a queue may replace the context, for its
+     * current item: nothing plays, is decoded or is decoding on the old one.
+     * A load superseded since it probed is aborted; callers check the signal.
+     */
+    private _canSwitchContextRate(index: number): boolean {
+        return this._loadingItem != null
+            && index === this._currentIndex
+            && !this._scheduled.size
+            && !this._decoded.size
+            && this._decoding.size <= 1;
     }
 
     private _applyVolume(): void {
@@ -984,13 +1143,14 @@ class WebAudioGaplessPlayer {
         }
     }
 
-    private async _decodeIndex(index: number): Promise<AudioBuffer> {
+    /** Resolves once the track is playable: fully decoded, or its first chunk for progressive FLAC. */
+    private async _decodeIndex(index: number): Promise<TrackAudio> {
         if (this._decoded.has(index)) {
-            return this._decoded.get(index) as AudioBuffer;
+            return this._decoded.get(index) as TrackAudio;
         }
 
         if (this._decoding.has(index)) {
-            return this._decoding.get(index) as Promise<AudioBuffer>;
+            return this._decoding.get(index) as Promise<TrackAudio>;
         }
 
         const item = this._playlist[index];
@@ -1012,7 +1172,7 @@ class WebAudioGaplessPlayer {
                 this._triggerDownloadProgress();
             }
         };
-        const decode = this._fetchAndDecode(url, abortController.signal, onProgress)
+        const decode = this._fetchAndDecode(url, index, abortController, onProgress)
             .then((audioBuffer) => {
                 // Cache only while this decode is still the registered one for
                 // the index. stop() and playlist mutations clear _decoding to
@@ -1024,8 +1184,18 @@ class WebAudioGaplessPlayer {
                     this._decodeAborts.delete(index);
                     this._downloadProgress.delete(index);
                     this._decoded.set(index, audioBuffer);
+                    if (!audioBuffer.settled) {
+                        // Keyed on the track, not the index: mutations re-key it.
+                        audioBuffer.subscribe(() => {
+                            if (this._decoded.get(this._currentIndex) === audioBuffer) {
+                                this._triggerDownloadProgress();
+                            }
+                        });
+                    }
                     this._scheduleDecodedLookahead(index, audioBuffer);
                     this._pruneDecoded();
+                } else {
+                    audioBuffer.abort();
                 }
 
                 return audioBuffer;
@@ -1044,66 +1214,161 @@ class WebAudioGaplessPlayer {
         return decode;
     }
 
+    /**
+     * Downloads and decodes a track. A FLAC stream at the context's sample
+     * rate resolves after its first chunk is decoded and keeps decoding into
+     * the returned track while it downloads; anything else resolves after the
+     * full download and decode. An abort of the controller rejects with an
+     * AbortError (or fails the track), which callers treat as "superseded".
+     */
     private async _fetchAndDecode(
         url: string,
-        signal: AbortSignal,
+        index: number,
+        abortController: AbortController,
         onProgress?: (loaded: number, total: number) => void
-    ): Promise<AudioBuffer> {
+    ): Promise<TrackAudio> {
         const response = await fetch(url, {
             credentials: getIncludeCorsCredentials() ? 'include' : 'same-origin',
-            signal
+            signal: abortController.signal
         });
 
         if (!response.ok) {
             throw new Error(`Failed to fetch gapless audio: ${response.status}`);
         }
 
-        const arrayBuffer = await this._readBody(response, onProgress);
+        if (!response.body) {
+            return this._decodeFull(new Uint8Array(await response.arrayBuffer()));
+        }
+
+        // Transcoded universal-audio streams may omit Content-Length; without
+        // a total there is no progress fraction to report.
+        const total = Number(response.headers.get('Content-Length')) || 0;
+        const stream = new ByteStream(response.body.getReader(), total, onProgress);
+        let probe = probeFlac(new Uint8Array(0));
+        // Re-probe only after the data doubled: a multi-megabyte cover image
+        // must not be copied on every read.
+        let probeAt = 0;
+        while (probe.kind === 'more' && await stream.read()) {
+            if (stream.loaded >= probeAt) {
+                probe = probeFlac(stream.bytes());
+                probeAt = stream.loaded * 2;
+            }
+        }
+        if (probe.kind === 'more') {
+            probe = probeFlac(stream.bytes());
+        }
+
+        if (probe.kind === 'flac') {
+            const { header } = probe;
+            if (this._audioContext && header.sampleRate !== this._audioContext.sampleRate && this._canSwitchContextRate(index)) {
+                await this._switchContextRate(header.sampleRate, index, abortController.signal);
+                // The wait does not notice an abort; a superseded load must not resolve.
+                abortController.signal.throwIfAborted();
+            }
+            const audioContext = this._audioContext;
+            if (audioContext && header.sampleRate === audioContext.sampleRate && header.totalSamples > 0) {
+                return this._decodeProgressive(audioContext, header, stream, abortController);
+            }
+        }
+
+        return this._decodeFull(await stream.readAll());
+    }
+
+    private async _decodeFull(bytes: Uint8Array): Promise<TrackAudio> {
         if (!this._audioContext) {
             throw new Error('AudioContext was closed before decode completed');
         }
 
-        return this._audioContext.decodeAudioData(stripLeadingId3(arrayBuffer));
+        const buffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+            ? bytes.buffer as ArrayBuffer
+            : bytes.slice().buffer;
+        return TrackAudio.fromBuffer(await this._audioContext.decodeAudioData(stripLeadingId3(buffer)));
     }
 
-    /**
-     * Reads the response body in chunks so download progress can be reported.
-     * Transcoded universal-audio streams may omit Content-Length; without a
-     * total there is no fraction to report, so read opaquely as before. An
-     * abort of the fetch signal rejects the chunk read with an AbortError,
-     * which callers already treat as "superseded".
-     */
-    private async _readBody(
-        response: Response,
-        onProgress?: (loaded: number, total: number) => void
-    ): Promise<ArrayBuffer> {
-        const total = Number(response.headers.get('Content-Length')) || 0;
-        if (!response.body || !onProgress || total <= 0) {
-            return response.arrayBuffer();
-        }
-
-        const reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let loaded = 0;
-        for (;;) {
-            const { done, value } = await reader.read();
-            if (done) {
-                break;
+    private async _decodeProgressive(
+        audioContext: AudioContext,
+        header: FlacHeader,
+        stream: ByteStream,
+        abortController: AbortController
+    ): Promise<TrackAudio> {
+        const chunker = new FlacChunker(header);
+        let track: TrackAudio;
+        let first: FlacChunk;
+        try {
+            chunker.push(stream.bytes().subarray(header.firstFrame));
+            let chunk = chunker.take(FIRST_CHUNK_BYTES, stream.done);
+            while (!chunk && !stream.done) {
+                const part = await stream.read();
+                if (part) {
+                    chunker.push(part);
+                }
+                chunk = chunker.take(FIRST_CHUNK_BYTES, stream.done);
             }
-            chunks.push(value);
-            loaded += value.byteLength;
-            onProgress(loaded, total);
+            if (!chunk) {
+                throw new Error('FLAC stream has no audio frames');
+            }
+            first = chunk;
+            track = new TrackAudio(header.totalSamples / header.sampleRate, abortController);
+            track.append(await decodeChunk(audioContext, first), Math.min(first.samples, header.totalSamples));
+            abortController.signal.throwIfAborted();
+        } catch (err) {
+            if (isAbortError(err)) {
+                throw err;
+            }
+            // Nothing plays yet: decode the whole file the regular way.
+            console.warn(`${LOG_PREFIX} progressive FLAC decode failed; decoding the full file`, err);
+            return this._decodeFull(await stream.readAll());
         }
 
-        const buffer = new ArrayBuffer(loaded);
-        const combined = new Uint8Array(buffer);
-        let offset = 0;
-        for (const chunk of chunks) {
-            combined.set(chunk, offset);
-            offset += chunk.byteLength;
-        }
+        stream.release();
+        void this._continueProgressive(audioContext, header, chunker, stream, track, first.samples);
+        return track;
+    }
 
-        return buffer;
+    private async _continueProgressive(
+        audioContext: AudioContext,
+        header: FlacHeader,
+        chunker: FlacChunker,
+        stream: ByteStream,
+        track: TrackAudio,
+        decodedSamples: number
+    ): Promise<void> {
+        try {
+            for (;;) {
+                let chunk = chunker.take(CHUNK_BYTES, stream.done);
+                while (chunk) {
+                    // Audio past the STREAMINFO length is cut: the next track
+                    // is scheduled at the declared end.
+                    const playable = Math.min(chunk.samples, header.totalSamples - decodedSamples);
+                    if (playable > 0) {
+                        track.append(await decodeChunk(audioContext, chunk), playable);
+                    }
+                    decodedSamples += chunk.samples;
+                    chunk = chunker.take(CHUNK_BYTES, stream.done);
+                }
+                if (stream.done) {
+                    break;
+                }
+                const part = await stream.read();
+                if (part) {
+                    chunker.push(part);
+                }
+            }
+            if (decodedSamples < header.totalSamples) {
+                // Truncated download: fail like a broken connection, so the
+                // stall at its end hands off instead of playing silence.
+                throw new Error(`FLAC stream ended after ${decodedSamples} of ${header.totalSamples} samples`);
+            }
+            if (decodedSamples > header.totalSamples) {
+                console.warn(`${LOG_PREFIX} FLAC stream has ${decodedSamples} samples, STREAMINFO says ${header.totalSamples}`);
+            }
+            track.finish();
+        } catch (err) {
+            if (!isAbortError(err)) {
+                console.warn(`${LOG_PREFIX} progressive FLAC decode failed mid-track`, err);
+            }
+            track.fail(err);
+        }
     }
 
     /**
@@ -1129,7 +1394,22 @@ class WebAudioGaplessPlayer {
 
     private _preloadNext(): void {
         const nextIndex = this._nextIndex(this._currentIndex);
-        if (nextIndex == null || this._decoded.has(nextIndex)) {
+        if (nextIndex == null || this._decoded.has(nextIndex) || this._decoding.has(nextIndex)) {
+            return;
+        }
+
+        const current = this._decoded.get(this._currentIndex);
+        if (current && !current.settled) {
+            // A second download would compete with the one still feeding the
+            // current track's chunks.
+            if (!this._preloadWaiters.has(current)) {
+                this._preloadWaiters.add(current);
+                current.whenSettled().then(() => {
+                    if (this._decoded.get(this._currentIndex) === current) {
+                        this._preloadNext();
+                    }
+                });
+            }
             return;
         }
 
@@ -1190,8 +1470,7 @@ class WebAudioGaplessPlayer {
             }
             index = movedIndex;
         }
-        const audioContext = this._audioContext;
-        if (playbackId !== this._playbackId || !audioContext) {
+        if (playbackId !== this._playbackId || !this._audioContext) {
             return;
         }
         if (this._reportedItem && this._interruptedAtMs == null) {
@@ -1201,15 +1480,25 @@ class WebAudioGaplessPlayer {
         this._stopTimeUpdates();
 
         this._currentIndex = index;
+        // Stop downloads the skip made useless; they would compete with the target's.
+        this._pruneDecoded();
         this._startWaitsForNext = waitForNext;
         this._basePositionMs = positionMs;
         this._pausePositionMs = positionMs;
         this._isPaused = false;
 
-        const currentBuffer = await this._decodeIndex(index).catch((err) => {
-            handOff(err);
-            return null;
-        });
+        const currentBuffer = await this._decodeIndex(index)
+            .then(async (track) => {
+                // A progressive track may not be decoded up to the start yet.
+                // The margin keeps a restart at a stall position from
+                // starting on the last decoded frame and stalling again.
+                await track.waitUntilDecoded(positionMs / 1000 + START_MARGIN_SEC);
+                return track;
+            })
+            .catch((err) => {
+                handOff(err);
+                return null;
+            });
         if (!currentBuffer) {
             return;
         }
@@ -1218,19 +1507,22 @@ class WebAudioGaplessPlayer {
             await this._decodeNextForBoundary(index);
         }
 
-        if (playbackId !== this._playbackId) {
+        // Re-read: the initial load may have moved the queue to a new context.
+        const audioContext = this._audioContext;
+        if (playbackId !== this._playbackId || !audioContext) {
             // Superseded by a newer play/seek/stop while decoding.
             return;
         }
 
-        const startedAt = audioContext.currentTime + 0.05;
-        const endsAt = startedAt + currentBuffer.duration - (positionMs / 1000);
+        const startedAt = snapToFrame(audioContext.currentTime + 0.05, audioContext.sampleRate);
+        const offsetSec = snapToFrame(positionMs / 1000, audioContext.sampleRate);
+        const endsAt = startedAt + currentBuffer.duration - offsetSec;
 
-        this._scheduleIndex(index, currentBuffer, startedAt, positionMs / 1000, playbackId);
+        this._scheduleIndex(index, currentBuffer, startedAt, offsetSec, playbackId);
         // Count from when the audio starts, not from before the decode.
         this._baseContextTime = startedAt;
         // Virtual position-0 start time, so startTime + duration = end of track.
-        this._schedule.set(index, { startTime: startedAt - (positionMs / 1000), playbackId });
+        this._schedule.set(index, { startTime: startedAt - offsetSec, playbackId });
 
         const nextIndex = this._nextIndex(index);
         if (nextIndex != null && nextIndex !== index) {
@@ -1275,16 +1567,14 @@ class WebAudioGaplessPlayer {
         this._events.trigger(this, 'unpause');
     }
 
-    private _scheduleIndex(index: number, audioBuffer: AudioBuffer, startTime: number, offsetSeconds: number, playbackId = this._playbackId): void {
+    private _scheduleIndex(index: number, track: TrackAudio, startTime: number, offsetSeconds: number, playbackId = this._playbackId): void {
         if (!this._audioContext || !this._gainNode || playbackId !== this._playbackId) {
             return;
         }
 
-        const source = this._audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(this._gainNode);
+        const source = new TrackVoice(this._audioContext, this._gainNode, track, startTime, offsetSeconds);
         source.onended = () => this._onSourceEnded(index, playbackId);
-        source.start(startTime, offsetSeconds);
+        source.onstalled = (positionSec) => this._onVoiceStalled(index, playbackId, positionSec);
         this._scheduled.set(index, source);
         this._scheduledStartTimes.set(index, startTime);
     }
@@ -1325,7 +1615,7 @@ class WebAudioGaplessPlayer {
         });
     }
 
-    private _scheduleDecodedLookahead(index: number, audioBuffer: AudioBuffer): void {
+    private _scheduleDecodedLookahead(index: number, audioBuffer: TrackAudio): void {
         const schedule = this._schedule.get(index);
         if (!schedule || this._isPaused || this._scheduled.has(index) || schedule.playbackId !== this._playbackId || !this._audioContext) {
             return;
@@ -1402,7 +1692,7 @@ class WebAudioGaplessPlayer {
             // when the decode finished): start it now instead of going silent.
             const nextBuffer = this._decoded.get(nextIndex);
             if (nextBuffer) {
-                const startTime = audioContext.currentTime;
+                const startTime = snapToFrame(audioContext.currentTime, audioContext.sampleRate);
                 this._schedule.set(nextIndex, { startTime, playbackId });
                 this._scheduleIndex(nextIndex, nextBuffer, startTime, 0, playbackId);
             }
@@ -1418,6 +1708,28 @@ class WebAudioGaplessPlayer {
         this._emitItemStarted();
         this._preloadNext();
         this._pruneDecoded();
+    }
+
+    /**
+     * A progressive track's download fell behind playback: its decoded audio
+     * ran out mid-track. Restart in place once the stall position is decoded,
+     * like a seek; a failed download hands off from there.
+     */
+    private _onVoiceStalled(index: number, playbackId: number, positionSec: number): void {
+        if (playbackId !== this._playbackId || index !== this._currentIndex || this._isPaused) {
+            return;
+        }
+
+        const positionMs = positionSec * 1000;
+        console.warn(`${LOG_PREFIX} progressive download fell behind playback; waiting`, {
+            index,
+            positionMs
+        });
+        // Freeze the position at the stall: no source plays until the restart.
+        this._stopScheduledSources();
+        this._basePositionMs = positionMs;
+        this._pausePositionMs = positionMs;
+        this._recoverAtIndex(index, positionMs, { waitForNext: false });
     }
 
     /**
@@ -1518,9 +1830,15 @@ class WebAudioGaplessPlayer {
         this._schedule.clear();
     }
 
-    private _clearDecodedAfterMutation(): void {
+    /** Drops all decode state; keep is a track that stays playing (re-keyed by the caller). */
+    private _clearDecodedAfterMutation(keep?: TrackAudio): void {
         for (const abortController of this._decodeAborts.values()) {
             abortController.abort();
+        }
+        for (const track of this._decoded.values()) {
+            if (track !== keep) {
+                track.abort();
+            }
         }
         this._decodeAborts.clear();
         this._decoded.clear();
@@ -1545,9 +1863,21 @@ class WebAudioGaplessPlayer {
             keep.add(nextIndex);
         }
 
-        for (const index of this._decoded.keys()) {
+        for (const [index, track] of this._decoded) {
             if (!keep.has(index)) {
+                track.abort();
                 this._decoded.delete(index);
+            }
+        }
+
+        // Unregister them too: a skip back must start a fresh decode, not
+        // join one that is about to fail with an AbortError.
+        for (const [index, abortController] of this._decodeAborts) {
+            if (!keep.has(index)) {
+                abortController.abort();
+                this._decodeAborts.delete(index);
+                this._decoding.delete(index);
+                this._downloadProgress.delete(index);
             }
         }
 

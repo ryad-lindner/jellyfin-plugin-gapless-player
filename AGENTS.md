@@ -72,6 +72,15 @@ The load-bearing ones:
 7. `_nextIndex` centralizes repeat-mode successor logic.
 8. No scheduled source for `_currentIndex` means a start is in flight;
    `getCurrentTimeMs()` then returns the target position, not a running clock.
+9. `_decoded` holds `TrackAudio`, which can still be downloading (progressive
+   FLAC); a "source" is a `TrackVoice` (one node per chunk). Anything that
+   drops a decoded track must `abort()` it, and a mutation that re-keys the
+   current voice rebinds `onstalled` as well as `onended`. Start times stay on
+   the sample grid (`snapToFrame`) or chunk joins are interpolated.
+10. The initial load may replace the `AudioContext` (sample-rate switch). That
+    stays safe only while removing an in-flight decode from `_decoding` also
+    aborts it, and code that schedules reads `this._audioContext` after its
+    last await instead of a reference captured before it.
 
 When porting fixes from the jellyfin-web fork, the player logic is identical
 except that fork module imports (`Events`, `appSettings`, `playbackManager`,
@@ -233,6 +242,9 @@ current release is confirmed working end-to-end.
   tracks (must hand off once to the normal player, with one itemstopped for
   the item that was announced): as the first track, after a pause during its
   load then unpause, and via next/select; remove-current during the load.
+  Progressive FLAC on a throttled network: time to first sound, a stall and
+  its resume, and Safari (the chunk length and sample-rate guards fall back
+  to the full-file decode; not verified on a device).
   On a phone: pause, seek and next while the AudioContext is suspended by a
   background interruption (iOS reports `'interrupted'`, treated like
   `'suspended'` by inference, not verified on a device).
