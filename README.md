@@ -33,7 +33,7 @@ without gaps. The normal HTML audio player stays as the fallback.
 ## Requirements
 
 - Jellyfin server **12.x** (the current official release line), at least the
-  version the release was built against (currently 12.3); the catalog hides it
+  version the release was built against (currently 12.4); the catalog hides it
   from older servers.
 - Jellyfin 10.11 is **frozen and unsupported**: its last build is 0.1.0.5
   (needs 10.11.11 or later) and it gets no further features or fixes.

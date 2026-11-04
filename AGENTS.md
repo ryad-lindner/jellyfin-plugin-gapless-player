@@ -207,7 +207,7 @@ refuses an unwritable output dir (remove it, or pass `OUT=<dir>`).
 
 Two phases:
 
-**Stabilization (current).** Until there is one accepted, working release, keep
+**Stabilization (ended with 0.1.0.8).** Until there is one accepted, working release, keep
 only the latest: each bump deletes the previous release + tag (GitHub and Gitea)
 and `manifest.json` lists a single version. Exception: v0.1.0.5 is never
 deleted, because the frozen `manifest-10.json` points at its jf10 zip.
@@ -216,14 +216,14 @@ worth preserving. Because there is no version history on the release page, the
 GitHub release notes and the manifest `changelog` describe the **whole feature
 set**, not the delta.
 
-**Normal versioning (once a first stable release is accepted).** Stop deleting
+**Normal versioning (current).** Stop deleting
 old releases; keep version history in the manifest (append new version entries,
 newest first), and let each release's notes/`changelog` describe the **changes in
 that version** (delta). New features then ship as new versions alongside the
 existing ones.
 
-We are in the stabilization phase now; switch to normal versioning once the
-current release is confirmed working end-to-end.
+Normal versioning applies since 0.1.0.9 (0.1.0.8 was confirmed working by
+users); release steps 5 and 6 follow the normal-versioning branch.
 
 ## Not done yet / TODO
 
