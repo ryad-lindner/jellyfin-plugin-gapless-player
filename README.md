@@ -44,9 +44,9 @@ without gaps. The normal HTML audio player stays as the fallback.
 
 Two ways: from the plugin repository (recommended, gets updates) or manually
 from a release zip. Both need one server restart and a hard refresh of the web
-client. Injection itself is live (response rewriting): only the initial plugin
-load needs a server restart; later enable/disable changes need a web-client
-reload.
+client. Injection itself is live (response rewriting): only loading a new
+plugin version (install or update) needs a server restart; enable/disable
+changes need a web-client reload.
 
 ### From the plugin repository
 
@@ -61,7 +61,8 @@ reload.
    Use the raw URL exactly as shown, not the GitHub page of the repository.
 3. **Dashboard → Plugins**, search for *Gapless Player* (or filter
    *Available*), open it and click **Install**.
-4. **Restart the server** once, so Jellyfin loads the plugin assembly.
+4. **Restart the server**, so Jellyfin loads the plugin assembly (again after
+   each update).
 5. [Hard-refresh the web client](#hard-refresh-the-web-client).
 
 Each Jellyfin major has its own build and its own manifest, so a server only
@@ -93,8 +94,8 @@ instead, add the repository as above.
 ### Hard refresh the web client
 
 The browser caches the web client, so it keeps running without the plugin
-until the cached `index.html` and `config.json` are reloaded. After installing
-(or uninstalling), clear the cache for your Jellyfin site and reload, for
+until the cached `index.html` and `config.json` are reloaded. After installing,
+updating or uninstalling, clear the cache for your Jellyfin site and reload, for
 example with **Ctrl+Shift+R** (**Cmd+Shift+R** on macOS), or in Chrome with
 DevTools open: right-click the reload button → **Empty cache and hard reload**.
 
@@ -110,6 +111,10 @@ DevTools open: right-click the reload button → **Empty cache and hard reload**
   above), check that **Enabled** is on in the plugin
   [settings](#configuration), that the ∞ toggle in the now-playing bar is on,
   and that the queue is [eligible](#how-it-works).
+- **Updated, but the old behavior remains**: the plugin page shows the new
+  version as soon as it is installed, but Jellyfin keeps running the old one
+  until the server restarts. Restart the server, then
+  [hard-refresh the web client](#hard-refresh-the-web-client).
 
 ### Uninstalling
 
