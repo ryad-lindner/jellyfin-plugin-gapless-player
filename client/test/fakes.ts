@@ -329,6 +329,119 @@ export class FakeSource {
     }
 }
 
+export interface FakeStreamDestination {
+    stream: { id: string };
+}
+
+export class FakeGain {
+    gain = { value: 1 };
+    outputs = new Set<unknown>();
+
+    connect(node: unknown): void {
+        this.outputs.add(node);
+    }
+
+    disconnect(): void {
+        this.outputs.clear();
+    }
+}
+
+export class FakeAudio {
+    static instances: FakeAudio[] = [];
+    /** Set: play() rejects with this DOMException name (e.g. 'NotAllowedError'). */
+    static playRejection: string | null = null;
+    /** True: play() stays pending until releasePlay() or pause(). */
+    static holdPlay = false;
+    paused = true;
+    hidden = false;
+    /** In the fake document body. */
+    attached = false;
+    readonly classes = new Set<string>();
+    readonly classList = { add: (name: string): void => void this.classes.add(name) };
+    private source: unknown = null;
+    /** 'pause' events dispatched, which integrations like Plasma rely on. */
+    pauseEvents = 0;
+    private listeners: (() => void)[] = [];
+    private pendingPlay: { resolve: () => void; reject: (err: unknown) => void } | null = null;
+    private queuedPauses: ReturnType<typeof setImmediate>[] = [];
+
+    constructor() {
+        FakeAudio.instances.push(this);
+    }
+
+    get srcObject(): unknown {
+        return this.source;
+    }
+
+    /**
+     * Like browsers, a new source runs the load algorithm: it drops queued
+     * 'pause' events, and pauses a playing element without one.
+     */
+    set srcObject(value: unknown) {
+        this.queuedPauses.forEach(clearImmediate);
+        this.queuedPauses = [];
+        this.paused = true;
+        this.pendingPlay?.reject(new DOMException('play() interrupted by a new load request', 'AbortError'));
+        this.pendingPlay = null;
+        this.source = value;
+    }
+
+    addEventListener(name: string, listener: () => void): void {
+        if (name === 'pause') {
+            this.listeners.push(listener);
+        }
+    }
+
+    removeEventListener(_name: string, listener: () => void): void {
+        this.listeners = this.listeners.filter(l => l !== listener);
+    }
+
+    play(): Promise<void> {
+        if (FakeAudio.playRejection) {
+            return Promise.reject(new DOMException('play() refused', FakeAudio.playRejection));
+        }
+        this.paused = false;
+        if (!FakeAudio.holdPlay) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve, reject) => {
+            this.pendingPlay = { resolve, reject };
+        });
+    }
+
+    releasePlay(): void {
+        this.pendingPlay?.resolve();
+        this.pendingPlay = null;
+    }
+
+    /** The browser aborts the pending play() on its own, leaving the element paused. */
+    abortPlay(): void {
+        this.paused = true;
+        this.pendingPlay?.reject(new DOMException('play() aborted', 'AbortError'));
+        this.pendingPlay = null;
+    }
+
+    pause(): void {
+        if (this.paused) {
+            return;
+        }
+        this.paused = true;
+        this.pendingPlay?.reject(new DOMException('play() interrupted by pause()', 'AbortError'));
+        this.pendingPlay = null;
+        // Like browsers, 'pause' is dispatched from a queued task.
+        const queued = setImmediate(() => {
+            this.queuedPauses = this.queuedPauses.filter(q => q !== queued);
+            this.pauseEvents++;
+            [...this.listeners].forEach(l => l());
+        });
+        this.queuedPauses.push(queued);
+    }
+
+    get playing(): boolean {
+        return !this.paused && this.srcObject != null;
+    }
+}
+
 export class FakeAudioContext {
     static instances: FakeAudioContext[] = [];
     /** The device rate a context gets without (or ignoring) a sampleRate option. */
@@ -337,6 +450,8 @@ export class FakeAudioContext {
     static honorsSampleRate = true;
     /** True: a context created with a sampleRate stays suspended (no user gesture). */
     static rateContextsStaySuspended = false;
+    /** False: createMediaStreamDestination throws. */
+    static supportsMediaStream = true;
     currentTime = 0;
     state = 'running';
     destination = {};
@@ -351,8 +466,18 @@ export class FakeAudioContext {
         }
     }
 
-    createGain(): { gain: { value: number }; connect(): void } {
-        return { gain: { value: 1 }, connect() {} };
+    createGain(): FakeGain {
+        return new FakeGain();
+    }
+
+    streamDestination: FakeStreamDestination | null = null;
+
+    createMediaStreamDestination(): FakeStreamDestination {
+        if (!FakeAudioContext.supportsMediaStream) {
+            throw new DOMException('not supported', 'NotSupportedError');
+        }
+        this.streamDestination = { stream: { id: `stream-${FakeAudioContext.instances.indexOf(this)}` } };
+        return this.streamDestination;
     }
 
     createBufferSource(): FakeSource {
@@ -481,20 +606,52 @@ export interface Harness {
     log: () => string[];
 }
 
+let bodyNodes: FakeAudio[] = [];
+
 function installGlobals(): void {
+    bodyNodes = [];
     const g = globalThis as Record<string, unknown>;
     const storage = new Map<string, string>();
     g.window = Object.assign(globalThis, {
         AudioContext: FakeAudioContext,
+        Audio: FakeAudio,
         location: { href: 'https://jf.test/web/' }
     });
-    g.document = { getElementById: () => null, hidden: false, hasFocus: () => true };
+    g.document = {
+        getElementById: () => null,
+        hidden: false,
+        hasFocus: () => true,
+        body: {
+            appendChild(node: FakeAudio): void {
+                node.attached = true;
+                bodyNodes.push(node);
+            }
+        },
+        querySelector(selector: string): FakeAudio | null {
+            const [tag, cls] = selector.split('.');
+            return tag === 'audio' ? bodyNodes.find(n => n.attached && n.classes.has(cls)) ?? null : null;
+        }
+    };
     g.localStorage = {
         getItem: (k: string) => storage.get(k) ?? null,
         setItem: (k: string, v: string) => storage.set(k, v)
     };
     g.fetch = fakeFetch;
+    mediaPositions.length = 0;
+    Object.defineProperty(globalThis, 'navigator', {
+        value: {
+            mediaSession: {
+                setPositionState(state?: MediaPositionState): void {
+                    mediaPositions.push(state ?? null);
+                }
+            }
+        },
+        configurable: true
+    });
 }
+
+/** Every navigator.mediaSession.setPositionState() call; null clears. */
+export const mediaPositions: (MediaPositionState | null)[] = [];
 
 const live: WebAudioGaplessPlayer[] = [];
 
@@ -505,12 +662,19 @@ export function disposeAll(): void {
     }
 }
 
-export function createHarness(): Harness {
-    installGlobals();
+/** samePage: keep the page (document, Audio elements) of the previous harness, like a new player in the same tab. */
+export function createHarness({ samePage = false } = {}): Harness {
+    if (!samePage) {
+        installGlobals();
+        FakeAudio.instances = [];
+    }
     FakeAudioContext.instances = [];
     FakeAudioContext.defaultSampleRate = 48_000;
     FakeAudioContext.honorsSampleRate = true;
     FakeAudioContext.rateContextsStaySuspended = false;
+    FakeAudioContext.supportsMediaStream = true;
+    FakeAudio.playRejection = null;
+    FakeAudio.holdPlay = false;
     tracks.clear();
     flacIds.length = 0;
     throttles.clear();

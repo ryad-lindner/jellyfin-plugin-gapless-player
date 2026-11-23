@@ -24,6 +24,9 @@ without gaps. The normal HTML audio player stays as the fallback.
   while it downloads. The queue's audio runs at the first track's sample rate,
   so these chunks join sample-exactly. Other formats, and FLAC at a different
   sample rate than the queue, are decoded after the full download.
+- The Web Audio output plays through a hidden `<audio>` element, because
+  browsers expose media keys and the system media controls (tray, lock screen)
+  only for media elements.
 - The server plugin injects the client bundle into the served web client by
   rewriting the `index.html` and `config.json` **responses** in-memory (ASP.NET
   middleware) and serving the bundle from the plugin. Nothing is written to the
@@ -180,6 +183,9 @@ fields in `artifacts/`.
 - On a connection slower than the track's bitrate, a FLAC track pauses where
   its download fell behind and continues once more is downloaded. Seeking past
   the downloaded part waits until it arrives.
+- KDE Plasma Browser Integration shows a running clock instead of the track
+  position, and keeps a paused entry after playback stops until the tab is
+  reloaded or closed.
 - Plugins are compatible with a single Jellyfin major; a server upgrade to a new
   major needs a matching plugin release.
 
