@@ -1,5 +1,6 @@
 import type { AppHostApi, AppSettingsApi, EventsApi, PlaybackManagerApi, PluginDeps } from './deps';
 import { FlacChunker, type FlacChunk, type FlacHeader, id3TagLength, probeFlac } from './flac';
+import { MediaElementOutput, setMediaPosition } from './mediaElementOutput';
 import { initNotifications } from './notifications';
 import { getServerConfig } from './serverConfig';
 import { setToggleDeps } from './toggle';
@@ -287,9 +288,10 @@ class WebAudioGaplessPlayer {
     private _seekedWhileLoading = false;
     // waitForNext of the latest _startFrom, for restarting it after a mutation.
     private _startWaitsForNext = true;
-    // A start waiting for a suspended AudioContext to resume; it has not
-    // touched the playback state yet, so pause, seek, next and previous act on
-    // its target. With a running context this window is one microtask.
+    // A start waiting for a suspended AudioContext to resume or the media
+    // element to play; it has not touched the playback state yet, so pause,
+    // seek, next and previous act on its target. With a running context and
+    // a playing element this window is one microtask.
     private _pendingStart: PendingStart | null = null;
     private _lastProgressTriggerMs = 0;
     private _scheduled = new Map<number, TrackVoice>();
@@ -317,6 +319,7 @@ class WebAudioGaplessPlayer {
     private _playbackId = 0;
     private _audioContext: AudioContext | null = null;
     private _gainNode: GainNode | null = null;
+    private _output: MediaElementOutput | null = null;
     private _timeUpdateInterval: ReturnType<typeof setInterval> | null = null;
 
     constructor(deps: PluginDeps) {
@@ -485,7 +488,7 @@ class WebAudioGaplessPlayer {
         this._stopScheduledSources();
         this._stopTimeUpdates();
         this._clearDecodedAfterMutation();
-        this._isPaused = true;
+        this._markPaused();
         this._lastProgressTriggerMs = 0;
         this._pausePositionMs = 0;
 
@@ -508,7 +511,7 @@ class WebAudioGaplessPlayer {
         // Silent: playbackManager destroys the player after it handled the
         // stop, and stop() takes its report before calling here.
         this._resetReportState();
-        this._isPaused = true;
+        this._endOutput();
         this._playbackId++;
         this._stopScheduledSources();
         this._stopTimeUpdates();
@@ -555,7 +558,8 @@ class WebAudioGaplessPlayer {
         this._playbackId++;
         this._stopScheduledSources();
         this._stopTimeUpdates();
-        this._isPaused = true;
+        this._markPaused();
+        this._updateMediaPosition();
         this._events.trigger(this, 'pause');
     }
 
@@ -662,6 +666,7 @@ class WebAudioGaplessPlayer {
             this._basePositionMs = positionMs;
             this._pausePositionMs = positionMs;
             if (!pending) {
+                this._updateMediaPosition();
                 this._events.trigger(this, 'timeupdate');
                 return Promise.resolve();
             }
@@ -910,6 +915,10 @@ class WebAudioGaplessPlayer {
             // so an unpause before then starts from the right position.
             this._pendingStart = null;
             this._restoreInterruptedPosition();
+            if (this._isPaused) {
+                // The start played the element for a target that never starts.
+                this._output?.pause();
+            }
         }
 
         if (!this._playlist.length) {
@@ -1055,9 +1064,14 @@ class WebAudioGaplessPlayer {
             }
             this._audioContext = new AudioContextCtor();
             this._gainNode = this._audioContext.createGain();
-            this._gainNode.connect(this._audioContext.destination);
             this._applyVolume();
         }
+        if (!this._output && this._gainNode) {
+            this._output = this._createOutput(this._audioContext, this._gainNode);
+        }
+        // Started before the resume: autoplay policies honor a play() closer
+        // to the user gesture.
+        this._output?.start();
 
         // iOS Safari reports 'interrupted' during an audio-session interruption.
         const audioContext = this._audioContext;
@@ -1074,6 +1088,39 @@ class WebAudioGaplessPlayer {
                 throw err;
             }
         }
+    }
+
+    private async _awaitOutputReady(): Promise<void> {
+        // A sample-rate switch during the wait replaces the output: wait for the new one.
+        for (let output = this._output; output; output = this._output) {
+            await output.ready();
+            if (output === this._output) {
+                break;
+            }
+        }
+    }
+
+    private _createOutput(context: AudioContext, gainNode: GainNode): MediaElementOutput {
+        // The browser paused the element (e.g. audio focus lost): pause like
+        // the stock player instead of running the clock without sound.
+        return new MediaElementOutput(context, gainNode, () => this.pause());
+    }
+
+    private _markPaused(): void {
+        this._isPaused = true;
+        this._output?.pause();
+    }
+
+    /** Stops playback for good (queue end, handoff): the OS media session ends. */
+    private _endOutput(): void {
+        this._isPaused = true;
+        this._releaseOutput();
+    }
+
+    private _releaseOutput(): void {
+        this._output?.dispose();
+        this._output = null;
+        setMediaPosition(0, null);
     }
 
     /**
@@ -1121,7 +1168,9 @@ class WebAudioGaplessPlayer {
         this.debugLog('switched AudioContext sample rate', { from: current.sampleRate, to: sampleRate });
         this._audioContext = next;
         this._gainNode = next.createGain();
-        this._gainNode.connect(next.destination);
+        this._output?.dispose();
+        this._output = this._createOutput(next, this._gainNode);
+        this._output.start();
         this._applyVolume();
         current.close().catch((err) => {
             console.warn(`${LOG_PREFIX} failed to close AudioContext`, err);
@@ -1458,6 +1507,7 @@ class WebAudioGaplessPlayer {
         };
         try {
             await this._ensureAudioGraph();
+            await this._awaitOutputReady();
         } catch (err) {
             handOff(err);
             return;
@@ -1572,6 +1622,7 @@ class WebAudioGaplessPlayer {
             this._events.trigger(this, 'timeupdate');
         }
 
+        this._updateMediaPosition();
         this._events.trigger(this, 'unpause');
     }
 
@@ -1657,7 +1708,7 @@ class WebAudioGaplessPlayer {
         const endPositionMs = item?.RunTimeTicks ? item.RunTimeTicks / TICKS_PER_MS : 0;
 
         if (nextIndex == null || !nextItem) {
-            this._isPaused = true;
+            this._endOutput();
             this._emitItemStopped(item, null, endPositionMs);
             return;
         }
@@ -1790,7 +1841,7 @@ class WebAudioGaplessPlayer {
         // The normal player owns these items now; playbackManager's player
         // switch calls stop(true) here, which must not report or cancel them.
         this._resetReportState();
-        this._isPaused = true;
+        this._endOutput();
         this._stopScheduledSources();
         this._stopTimeUpdates();
 
@@ -2052,7 +2103,12 @@ class WebAudioGaplessPlayer {
         this._reportedItem = this.currentItem();
         this._awaitedItem = null;
         this._interruptedAtMs = null;
+        this._updateMediaPosition();
         this._events.trigger(this, 'itemstarted', [this.currentItem(), this.currentMediaSource()]);
+    }
+
+    private _updateMediaPosition(): void {
+        setMediaPosition(this.getCurrentTimeMs(), this.duration());
     }
 
     private _emitItemStopped(item: GaplessItem, nextItem: GaplessItem | null, positionMs = 0): void {
@@ -2083,6 +2139,8 @@ class WebAudioGaplessPlayer {
         this._stopTimeUpdates();
         this._timeUpdateInterval = setInterval(() => {
             if (!this._isPaused) {
+                // Also corrects the session's extrapolation for clock drift.
+                this._updateMediaPosition();
                 this._events.trigger(this, 'timeupdate');
             }
         }, TIMEUPDATE_INTERVAL_MS);

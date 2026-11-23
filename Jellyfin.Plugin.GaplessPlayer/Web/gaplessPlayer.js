@@ -241,6 +241,176 @@
     }
   };
 
+  // src/mediaElementOutput.ts
+  var LOG_PREFIX = "[GaplessPlayer]";
+  var positionSet = false;
+  function setMediaPosition(positionMs, durationMs) {
+    const session = typeof navigator !== "undefined" ? navigator.mediaSession : void 0;
+    if (!session?.setPositionState) {
+      return;
+    }
+    try {
+      if (durationMs == null || !(durationMs > 0)) {
+        if (positionSet) {
+          positionSet = false;
+          session.setPositionState();
+        }
+        return;
+      }
+      const duration = durationMs / 1e3;
+      const position = Number.isFinite(positionMs) ? Math.min(Math.max(0, positionMs / 1e3), duration) : 0;
+      session.setPositionState({ duration, playbackRate: 1, position });
+      positionSet = true;
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} failed to set the media position`, err);
+    }
+  }
+  var ELEMENT_START_TIMEOUT_MS = 1e3;
+  var ELEMENT_CLASS = "gaplessPlayerAudio";
+  var elementOwner = null;
+  function sharedElement() {
+    let element = document.querySelector(`audio.${ELEMENT_CLASS}`);
+    if (!element) {
+      element = new Audio();
+      element.classList.add(ELEMENT_CLASS);
+      element.hidden = true;
+      document.body.appendChild(element);
+    }
+    return element;
+  }
+  var MediaElementOutput = class {
+    constructor(context, _input, _onExternalPause) {
+      this._input = _input;
+      this._onExternalPause = _onExternalPause;
+      this._streamNode = null;
+      this._element = null;
+      // Set once a play() of ours took effect, cleared by our own pause: a
+      // 'pause' event while set comes from the browser.
+      this._playing = false;
+      // The pending play(): settles true when the element plays, false on any
+      // failure. Our own pause or dispose drops it.
+      this._starting = null;
+      // ready()'s deadline for the pending play(), shared by concurrent calls.
+      this._startDeadline = null;
+      this._disposed = false;
+      this._refusalLogged = false;
+      // 'pause' events our pause() queued that were not dispatched yet.
+      this._queuedPauses = 0;
+      this._pauseListener = () => {
+        this._queuedPauses = Math.max(0, this._queuedPauses - 1);
+        if (!this._disposed) {
+          this._onElementPause();
+        } else if (this._queuedPauses === 0) {
+          this._release();
+        }
+      };
+      this._destination = context.destination;
+      if (typeof context.createMediaStreamDestination === "function" && typeof Audio === "function") {
+        try {
+          const streamNode = context.createMediaStreamDestination();
+          const element = sharedElement();
+          elementOwner?._detach();
+          elementOwner = this;
+          element.srcObject = streamNode.stream;
+          element.addEventListener("pause", this._pauseListener);
+          this._streamNode = streamNode;
+          this._element = element;
+        } catch (err) {
+          console.warn(`${LOG_PREFIX} media element output unavailable`, err);
+        }
+      }
+      this._viaElement = this._streamNode != null;
+      _input.connect(this._streamNode ?? this._destination);
+    }
+    start() {
+      const element = this._element;
+      if (!element || this._disposed || this._starting || !element.paused) {
+        return;
+      }
+      const starting = element.play().then(() => true, (err) => {
+        if (this._starting === starting && !this._refusalLogged) {
+          this._refusalLogged = true;
+          console.warn(`${LOG_PREFIX} media element did not play; using direct output`, err);
+        }
+        return false;
+      }).then((played) => {
+        if (this._starting === starting) {
+          this._starting = null;
+          this._playing = played;
+        }
+        return played;
+      });
+      this._starting = starting;
+    }
+    /**
+     * Settles the route before audio is scheduled: through the element once it
+     * plays (the stream is live, so audio rendered before would be lost),
+     * otherwise past it. Waits for a pending play() until
+     * ELEMENT_START_TIMEOUT_MS after the first ready() for it. Never rejects.
+     */
+    async ready() {
+      const starting = this._starting;
+      if (starting) {
+        await Promise.race([starting, this._deadlineFor(starting)]);
+      }
+      if (!this._disposed) {
+        this._route(this._playing);
+      }
+    }
+    _deadlineFor(starting) {
+      if (this._startDeadline?.starting !== starting) {
+        let timer;
+        const expired = new Promise((resolve) => {
+          timer = setTimeout(resolve, ELEMENT_START_TIMEOUT_MS);
+        });
+        void starting.then(() => clearTimeout(timer));
+        this._startDeadline = { starting, expired };
+      }
+      return this._startDeadline.expired;
+    }
+    pause() {
+      this._playing = false;
+      this._starting = null;
+      if (this._element && !this._element.paused) {
+        this._queuedPauses++;
+        this._element.pause();
+      }
+    }
+    /** Releases the element; emptying it ends its OS media session playback. */
+    dispose() {
+      this._disposed = true;
+      this.pause();
+      this._input.disconnect();
+      if (this._queuedPauses === 0) {
+        this._release();
+      }
+    }
+    _release() {
+      this._detach();
+      if (elementOwner === this && this._element) {
+        elementOwner = null;
+        this._element.srcObject = null;
+      }
+    }
+    _detach() {
+      this._element?.removeEventListener("pause", this._pauseListener);
+    }
+    _route(viaElement) {
+      if (!this._streamNode || viaElement === this._viaElement) {
+        return;
+      }
+      this._input.disconnect();
+      this._input.connect(viaElement ? this._streamNode : this._destination);
+      this._viaElement = viaElement;
+    }
+    _onElementPause() {
+      if (this._playing && this._element?.paused && !this._disposed) {
+        this._playing = false;
+        this._onExternalPause();
+      }
+    }
+  };
+
   // src/serverConfig.ts
   var SCRIPT_ID = "gapless-player-plugin";
   function getServerConfig() {
@@ -254,7 +424,7 @@
   }
 
   // src/notifications.ts
-  var LOG_PREFIX = "[GaplessPlayer]";
+  var LOG_PREFIX2 = "[GaplessPlayer]";
   var NOTIFICATION_TAG = "gapless-player-now-playing";
   var ICON_MAX_HEIGHT = 256;
   var DUPLICATE_WINDOW_MS = 5e3;
@@ -317,7 +487,7 @@
       const registration = await navigator.serviceWorker?.getRegistration();
       await registration?.showNotification(title, options);
     } catch (err) {
-      console.warn(`${LOG_PREFIX} could not show now-playing notification`, err);
+      console.warn(`${LOG_PREFIX2} could not show now-playing notification`, err);
     }
   }
   function requestPermission() {
@@ -371,7 +541,7 @@
   // src/toggle.ts
   var SETTING_ENABLED = "enableWebAudioGapless";
   var BUTTON_CLASS = "gaplessToggleButton";
-  var LOG_PREFIX2 = "[GaplessPlayer]";
+  var LOG_PREFIX3 = "[GaplessPlayer]";
   var deps = null;
   function setToggleDeps(value) {
     deps = value;
@@ -447,7 +617,7 @@
       });
       return true;
     } catch (err) {
-      console.warn(`${LOG_PREFIX2} live toggle restart failed; applies on next playback`, err);
+      console.warn(`${LOG_PREFIX3} live toggle restart failed; applies on next playback`, err);
       return false;
     }
   }
@@ -689,7 +859,7 @@
   var CHUNK_BYTES = 1024 * 1024;
   var CONTEXT_SWITCH_TIMEOUT_MS = 300;
   var START_MARGIN_SEC = 1e-3;
-  var LOG_PREFIX3 = "[GaplessPlayer]";
+  var LOG_PREFIX4 = "[GaplessPlayer]";
   var SETTING_ENABLED2 = "enableWebAudioGapless";
   var SETTING_DEBUG = "enableWebAudioGaplessDebug";
   var SETTING_VOLUME = "volume";
@@ -836,9 +1006,10 @@
       this._seekedWhileLoading = false;
       // waitForNext of the latest _startFrom, for restarting it after a mutation.
       this._startWaitsForNext = true;
-      // A start waiting for a suspended AudioContext to resume; it has not
-      // touched the playback state yet, so pause, seek, next and previous act on
-      // its target. With a running context this window is one microtask.
+      // A start waiting for a suspended AudioContext to resume or the media
+      // element to play; it has not touched the playback state yet, so pause,
+      // seek, next and previous act on its target. With a running context and
+      // a playing element this window is one microtask.
       this._pendingStart = null;
       this._lastProgressTriggerMs = 0;
       this._scheduled = /* @__PURE__ */ new Map();
@@ -866,6 +1037,7 @@
       this._playbackId = 0;
       this._audioContext = null;
       this._gainNode = null;
+      this._output = null;
       this._timeUpdateInterval = null;
       this._events = deps2.events;
       this._appSettings = deps2.appSettings;
@@ -900,9 +1072,9 @@
         return;
       }
       if (data === void 0) {
-        console.debug(`${LOG_PREFIX3} ${message}`);
+        console.debug(`${LOG_PREFIX4} ${message}`);
       } else {
-        console.debug(`${LOG_PREFIX3} ${message}`, data);
+        console.debug(`${LOG_PREFIX4} ${message}`, data);
       }
     }
     // --- Player contract ---------------------------------------------------
@@ -959,7 +1131,7 @@
         if (isAbortError(err) || loadId !== this._playbackId) {
           return;
         }
-        console.warn(`${LOG_PREFIX3} initial decode failed; handing off to normal playback`, err);
+        console.warn(`${LOG_PREFIX4} initial decode failed; handing off to normal playback`, err);
         this._handoffToNormalPlayback(this._currentIndex, Math.round(this._basePositionMs * TICKS_PER_MS));
         return;
       }
@@ -986,7 +1158,7 @@
       this._stopScheduledSources();
       this._stopTimeUpdates();
       this._clearDecodedAfterMutation();
-      this._isPaused = true;
+      this._markPaused();
       this._lastProgressTriggerMs = 0;
       this._pausePositionMs = 0;
       if (destroyPlayer) {
@@ -1003,7 +1175,7 @@
     }
     destroy() {
       this._resetReportState();
-      this._isPaused = true;
+      this._endOutput();
       this._playbackId++;
       this._stopScheduledSources();
       this._stopTimeUpdates();
@@ -1011,7 +1183,7 @@
       this._clearPlaylistState();
       if (this._audioContext) {
         this._audioContext.close().catch((err) => {
-          console.warn(`${LOG_PREFIX3} failed to close AudioContext`, err);
+          console.warn(`${LOG_PREFIX4} failed to close AudioContext`, err);
         });
         this._audioContext = null;
       }
@@ -1038,7 +1210,8 @@
       this._playbackId++;
       this._stopScheduledSources();
       this._stopTimeUpdates();
-      this._isPaused = true;
+      this._markPaused();
+      this._updateMediaPosition();
       this._events.trigger(this, "pause");
     }
     resume() {
@@ -1056,7 +1229,7 @@
     currentTime(val) {
       if (val != null) {
         this._seekToMs(val).catch((err) => {
-          console.error(`${LOG_PREFIX3} failed to seek`, err);
+          console.error(`${LOG_PREFIX4} failed to seek`, err);
         });
       }
       return this.getCurrentTimeMs();
@@ -1109,6 +1282,7 @@
         this._basePositionMs = positionMs;
         this._pausePositionMs = positionMs;
         if (!pending) {
+          this._updateMediaPosition();
           this._events.trigger(this, "timeupdate");
           return Promise.resolve();
         }
@@ -1292,6 +1466,9 @@
       if (pending && pending.playbackId === this._playbackId && !this._pendingTarget()) {
         this._pendingStart = null;
         this._restoreInterruptedPosition();
+        if (this._isPaused) {
+          this._output?.pause();
+        }
       }
       if (!this._playlist.length) {
         return this.stop(true);
@@ -1378,7 +1555,7 @@
           if (isAbortError(err) || playbackId !== this._playbackId) {
             return;
           }
-          console.error(`${LOG_PREFIX3} failed to restart load after playlist mutation`, err);
+          console.error(`${LOG_PREFIX4} failed to restart load after playlist mutation`, err);
           this._handoffToNormalPlayback(newCurrentIndex, Math.round(this._pausePositionMs * TICKS_PER_MS));
         });
         return;
@@ -1404,9 +1581,12 @@
         }
         this._audioContext = new AudioContextCtor();
         this._gainNode = this._audioContext.createGain();
-        this._gainNode.connect(this._audioContext.destination);
         this._applyVolume();
       }
+      if (!this._output && this._gainNode) {
+        this._output = this._createOutput(this._audioContext, this._gainNode);
+      }
+      this._output?.start();
       const audioContext = this._audioContext;
       const state = audioContext.state;
       if (state === "suspended" || state === "interrupted") {
@@ -1419,6 +1599,31 @@
           throw err;
         }
       }
+    }
+    async _awaitOutputReady() {
+      for (let output = this._output; output; output = this._output) {
+        await output.ready();
+        if (output === this._output) {
+          break;
+        }
+      }
+    }
+    _createOutput(context, gainNode) {
+      return new MediaElementOutput(context, gainNode, () => this.pause());
+    }
+    _markPaused() {
+      this._isPaused = true;
+      this._output?.pause();
+    }
+    /** Stops playback for good (queue end, handoff): the OS media session ends. */
+    _endOutput() {
+      this._isPaused = true;
+      this._releaseOutput();
+    }
+    _releaseOutput() {
+      this._output?.dispose();
+      this._output = null;
+      setMediaPosition(0, null);
     }
     /**
      * Moves a queue that has not started yet onto an AudioContext running at
@@ -1464,10 +1669,12 @@
       this.debugLog("switched AudioContext sample rate", { from: current.sampleRate, to: sampleRate });
       this._audioContext = next;
       this._gainNode = next.createGain();
-      this._gainNode.connect(next.destination);
+      this._output?.dispose();
+      this._output = this._createOutput(next, this._gainNode);
+      this._output.start();
       this._applyVolume();
       current.close().catch((err) => {
-        console.warn(`${LOG_PREFIX3} failed to close AudioContext`, err);
+        console.warn(`${LOG_PREFIX4} failed to close AudioContext`, err);
       });
     }
     /**
@@ -1619,7 +1826,7 @@
         if (isAbortError(err)) {
           throw err;
         }
-        console.warn(`${LOG_PREFIX3} progressive FLAC decode failed; decoding the full file`, err);
+        console.warn(`${LOG_PREFIX4} progressive FLAC decode failed; decoding the full file`, err);
         return this._decodeFull(await stream.readAll(), maxDuration);
       }
       stream.release();
@@ -1647,12 +1854,12 @@
           stream.cancel();
         }
         if (decodedSamples > header.totalSamples) {
-          console.warn(`${LOG_PREFIX3} FLAC stream is longer than its STREAMINFO total of ${header.totalSamples} samples; the rest is cut`);
+          console.warn(`${LOG_PREFIX4} FLAC stream is longer than its STREAMINFO total of ${header.totalSamples} samples; the rest is cut`);
         }
         track.finish();
       } catch (err) {
         if (!isAbortError(err)) {
-          console.warn(`${LOG_PREFIX3} progressive FLAC decode failed mid-track`, err);
+          console.warn(`${LOG_PREFIX4} progressive FLAC decode failed mid-track`, err);
         }
         track.fail(err);
       }
@@ -1693,7 +1900,7 @@
       }
       this._decodeIndex(nextIndex).catch((err) => {
         if (!isAbortError(err)) {
-          console.warn(`${LOG_PREFIX3} failed to preload next item`, err);
+          console.warn(`${LOG_PREFIX4} failed to preload next item`, err);
         }
       });
     }
@@ -1716,11 +1923,12 @@
         if (isAbortError(err) || playbackId !== this._playbackId) {
           return;
         }
-        console.error(`${LOG_PREFIX3} failed to start; handing off to normal playback`, err);
+        console.error(`${LOG_PREFIX4} failed to start; handing off to normal playback`, err);
         this._handoffToNormalPlayback(index, Math.round(positionMs * TICKS_PER_MS));
       };
       try {
         await this._ensureAudioGraph();
+        await this._awaitOutputReady();
       } catch (err) {
         handOff(err);
         return;
@@ -1799,6 +2007,7 @@
       } else {
         this._events.trigger(this, "timeupdate");
       }
+      this._updateMediaPosition();
       this._events.trigger(this, "unpause");
     }
     _scheduleIndex(index, track, startTime, offsetSeconds, playbackId = this._playbackId) {
@@ -1824,7 +2033,7 @@
         await this._decodeIndex(nextIndex);
       } catch (err) {
         if (!isAbortError(err)) {
-          console.warn(`${LOG_PREFIX3} failed to decode next item before boundary`, err);
+          console.warn(`${LOG_PREFIX4} failed to decode next item before boundary`, err);
         }
       }
     }
@@ -1865,7 +2074,7 @@
       const nextItem = nextIndex != null ? this._playlist[nextIndex] : null;
       const endPositionMs = item?.RunTimeTicks ? item.RunTimeTicks / TICKS_PER_MS : 0;
       if (nextIndex == null || !nextItem) {
-        this._isPaused = true;
+        this._endOutput();
         this._emitItemStopped(item, null, endPositionMs);
         return;
       }
@@ -1880,7 +2089,7 @@
         this._currentIndex = nextIndex;
         this._basePositionMs = 0;
         this._pausePositionMs = 0;
-        console.warn(`${LOG_PREFIX3} boundary missed; recovering in place`, {
+        console.warn(`${LOG_PREFIX4} boundary missed; recovering in place`, {
           index,
           nextIndex,
           currentTime: audioContext.currentTime,
@@ -1923,7 +2132,7 @@
         return;
       }
       const positionMs = positionSec * 1e3;
-      console.warn(`${LOG_PREFIX3} progressive download fell behind playback; waiting`, {
+      console.warn(`${LOG_PREFIX4} progressive download fell behind playback; waiting`, {
         index,
         positionMs
       });
@@ -1952,7 +2161,7 @@
         if (isAbortError(err) || playbackId !== this._playbackId) {
           return;
         }
-        console.error(`${LOG_PREFIX3} failed to recover gapless playback`, err);
+        console.error(`${LOG_PREFIX4} failed to recover gapless playback`, err);
         this._handoffToNormalPlayback(index, Math.round(positionMs * TICKS_PER_MS));
       });
     }
@@ -1963,7 +2172,7 @@
         this._emitItemStopped(owed.item, this._playlist[startIndex] ?? null, owed.positionMs);
       }
       this._resetReportState();
-      this._isPaused = true;
+      this._endOutput();
       this._stopScheduledSources();
       this._stopTimeUpdates();
       this._playbackManager.play({
@@ -1973,7 +2182,7 @@
         startPositionTicks,
         enableWebAudioGapless: false
       }).catch((err) => {
-        console.error(`${LOG_PREFIX3} failed to hand off to normal playback`, err);
+        console.error(`${LOG_PREFIX4} failed to hand off to normal playback`, err);
       });
     }
     _scheduleLookaheadForCurrent() {
@@ -2181,7 +2390,11 @@
       this._reportedItem = this.currentItem();
       this._awaitedItem = null;
       this._interruptedAtMs = null;
+      this._updateMediaPosition();
       this._events.trigger(this, "itemstarted", [this.currentItem(), this.currentMediaSource()]);
+    }
+    _updateMediaPosition() {
+      setMediaPosition(this.getCurrentTimeMs(), this.duration());
     }
     _emitItemStopped(item, nextItem, positionMs = 0) {
       this._reportedItem = null;
@@ -2208,6 +2421,7 @@
       this._stopTimeUpdates();
       this._timeUpdateInterval = setInterval(() => {
         if (!this._isPaused) {
+          this._updateMediaPosition();
           this._events.trigger(this, "timeupdate");
         }
       }, TIMEUPDATE_INTERVAL_MS);
